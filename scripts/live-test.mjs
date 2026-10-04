@@ -234,20 +234,6 @@ console.log("=== C. args repair on live-captured output, truncated at the wire b
 			prompt_eval_count: 10,
 			eval_count: 5,
 		});
-		const replayFetch = (async () => ({
-			ok: true,
-			status: 200,
-			text: async () => "",
-			body: new ReadableStream({
-				start(controller) {
-					const encoder = new TextEncoder();
-					controller.enqueue(encoder.encode(`${chunk}\n`));
-					controller.enqueue(encoder.encode(`${doneChunk}\n`));
-					controller.close();
-				},
-			}),
-		}))();
-		void replayFetch;
 		const { final: replayed } = await callModel([{ role: "user", content: "x", timestamp: 1 }], TOOLS, {
 			fetch: async () => ({
 				ok: true,
