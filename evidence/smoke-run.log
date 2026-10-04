@@ -1,0 +1,21 @@
+=== 1. /mini on ===
+(node:32640) [DEP0190] DeprecationWarning: Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.
+(Use `node --trace-deprecation ...` to show where the warning was created)
+  PASS  /mini on executed
+=== 2. native tool-call continuation (read) ===
+  PASS  prompt task-read accepted
+  PASS  read tool executed via native loop — tool starts: read
+  PASS  assistant produced final text
+=== 3. forced wrap-fix case (strict) ===
+  PASS  prompt task-wrap accepted
+  PASS  model emitted the wrapped JSON as literal text
+  PASS  wrap-fix FIRED (wrapfix_call_ marker in assistant message)
+  PASS  converted call executed the read tool
+=== 4. delegate_to_worker round trip ===
+  PASS  prompt task-delegate accepted
+  PASS  delegate_to_worker executed — tool starts: delegate_to_worker
+  PASS  worker returned a successful report — {"content":[{"type":"text","text":"[worker result]\nhello from the worker."}],"details":{"ok":true},"isError":false}
+=== 5. /mini off ===
+  PASS  /mini off executed
+
+SMOKE PASS

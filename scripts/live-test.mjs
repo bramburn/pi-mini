@@ -1,17 +1,29 @@
 // Live harness for pi-mini against a running Ollama with granite4.2:8b.
 //
-// Ports the lab scenarios through the real ollama-native.ts pipeline:
-//   A. multi-step tool loop continuation + clean termination
-//   B. wrap-prone output still materializes a real tool call (native or wrap-fix)
-//   C. args repair on the captured giant-args truncation shape (deterministic)
-//   D. giant-args watchdog: the red-black-tree stall case must terminate
+// Strict by design: repair scenarios assert the repair paths actually FIRED
+// (wrap-fix via the `wrapfix_call_` id marker set by ollama-native.ts; args
+// repair via live-captured output truncated at the wire boundary and replayed
+// through the production pipeline). No native-route escape branches.
+//
+//   A. multi-step tool loop continuation + clean termination (live)
+//   B. forced wrap-fix: dictated wrapped JSON text must convert + execute (live)
+//   C. args repair on live-captured output, truncated at the wire boundary
+//   D. giant-args watchdog: the red-black-tree stall case must terminate (live)
 //
 // Requests run strictly sequentially (single-slot Ollama server).
+// Run logs are persisted to evidence/ by the caller (tee).
 // Usage: node scripts/live-test.mjs   (exit 0 = all PASS)
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ollamaNativeApi } from "../ollama-native.ts";
 import { repairArgs } from "../wrapfix.ts";
 import { OLLAMA_BASE_URL, TINY_MODEL_ID } from "../settings.ts";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const fixturesDir = path.join(repoRoot, "evidence", "fixtures");
+fs.mkdirSync(fixturesDir, { recursive: true });
 
 const model = {
 	id: TINY_MODEL_ID,
@@ -68,11 +80,11 @@ function fakeExecute(call) {
 	return { text: `unknown tool ${call.name}`, isError: true };
 }
 
-async function callModel(messages, tools) {
+async function callModel(messages, tools, opts = {}) {
 	const stream = api.streamSimple(
 		model,
-		{ systemPrompt: SYSTEM, messages: structuredClone(messages), tools },
-		{ maxTokens: 8192 },
+		{ systemPrompt: opts.systemPrompt ?? SYSTEM, messages: structuredClone(messages), tools },
+		{ maxTokens: opts.maxTokens ?? 8192, fetch: opts.fetch },
 	);
 	const events = [];
 	for await (const event of stream) events.push(event);
@@ -80,10 +92,22 @@ async function callModel(messages, tools) {
 	return { final, events };
 }
 
+/** Truncation-repair semantics: every recovered key/value must be a prefix of the original. */
+function isPrefixObject(original, repaired) {
+	if (!repaired || typeof repaired !== "object") return false;
+	for (const [key, value] of Object.entries(repaired)) {
+		if (!(key in original)) return false;
+		if (typeof value === "string") {
+			if (typeof original[key] !== "string" || !original[key].startsWith(value)) return false;
+		} else if (JSON.stringify(value) !== JSON.stringify(original[key])) return false;
+	}
+	return true;
+}
+
 const SYSTEM =
 	"You are a file assistant. Use tools to complete tasks. Keep tool calls minimal and precise. Finish with a one-line summary.";
 
-console.log("=== A. multi-step loop continuation + termination ===");
+console.log("=== A. multi-step loop continuation + termination (live) ===");
 {
 	const messages = [
 		{
@@ -114,12 +138,8 @@ console.log("=== A. multi-step loop continuation + termination ===");
 		}
 		totalCalls += calls.length;
 		for (const call of calls) {
+			check(`step ${step} call ${call.name} has parseable args`, typeof call.arguments === "object" && call.arguments !== null);
 			const result = fakeExecute(call);
-			check(
-				`step ${step} call ${call.name} has parseable args`,
-				typeof call.arguments === "object" && call.arguments !== null,
-				JSON.stringify(call.arguments).slice(0, 80),
-			);
 			messages.push({
 				role: "toolResult",
 				toolCallId: call.id,
@@ -134,53 +154,125 @@ console.log("=== A. multi-step loop continuation + termination ===");
 	check("loop terminated with final text, no trailing call", terminated, finalText.slice(0, 80));
 }
 
-console.log("=== B. wrap-prone output materializes a real tool call ===");
+console.log("=== B. forced wrap-fix: dictated wrapped JSON converts + executes (live) ===");
 {
+	// Dictation framing forces literal wrapped text even with tools registered
+	// (validated 2026-10-04: V1/V2/V4 probe variants all fire repairFired=true).
 	const messages = [
 		{
-			role: "assistant",
-			content: [
-				{
-					type: "text",
-					text: '```json\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n```',
-				},
-			],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-			stopReason: "toolUse",
+			role: "user",
+			content:
+				'Output exactly these two lines and nothing else:\n```json\n{"name": "read_file", "arguments": {"path": "notes.txt"}}\n```',
 			timestamp: 1,
 		},
-		{ role: "user", content: "Now read notes.txt the same way as your previous message.", timestamp: 2 },
 	];
-	const { final } = await callModel(messages, TOOLS);
-	const rawText = final.content
-		.filter((block) => block.type === "text")
-		.map((block) => block.text)
+	const { final, events } = await callModel(messages, TOOLS, {
+		systemPrompt: "You are a transcription assistant. You never call tools; you only repeat text as instructed.",
+		maxTokens: 400,
+	});
+	// Raw streamed text, before the repair pass strips the converted span from
+	// the final message.
+	const rawText = events
+		.filter((event) => event.type === "text_delta")
+		.map((event) => event.delta)
 		.join("");
 	const call = final.content.find((block) => block.type === "toolCall");
-	check("a toolCall block was produced (native or wrap-fix)", !!call);
-	if (call) {
-		check("call targets read_file", call.name === "read_file", call.name);
-		check("call args point at notes.txt", call.arguments?.path === "notes.txt", JSON.stringify(call.arguments));
+	const sawWrappedText = rawText.includes('"name"') || rawText.includes('\\"name\\"');
+	const repairFired = !!call && String(call.id).startsWith("wrapfix_call_");
+	check("model emitted the wrapped JSON as literal text", sawWrappedText);
+	check("wrap-fix fired (wrapfix_call_ marker) with stopReason toolUse", repairFired && final.stopReason === "toolUse", `id=${call?.id} stop=${final.stopReason}`);
+	check("converted call targets read_file/notes.txt", repairFired && call.name === "read_file" && call.arguments?.path === "notes.txt", JSON.stringify(call?.arguments));
+	if (repairFired) {
+		const result = fakeExecute(call);
+		check("converted call executes against the tool", result.isError === false);
 	}
-	const route = rawText.includes('"name"') ? "wrap-fix converted text call" : "native tool call";
-	console.log(`  info: route = ${route}`);
 }
 
-console.log("=== C. args repair on captured truncation shape (deterministic) ===");
+console.log("=== C. args repair on live-captured output, truncated at the wire boundary ===");
 {
-	const truncated = '{"path": "example.py", "content": "def fib(n):';
-	const repaired = repairArgs(truncated);
-	check(
-		"truncated giant-args string repairs to a valid object",
-		repaired?.path === "example.py" && repaired?.content === "def fib(n):",
-		JSON.stringify(repaired),
-	);
+	// C1: capture a real live call's argument payload.
+	const messages = [
+		{ role: "user", content: "Create story.txt with a 3-sentence story about a robot.", timestamp: 1 },
+	];
+	const { final } = await callModel(messages, TOOLS);
+	const call = final.content.find((block) => block.type === "toolCall");
+	check("live model produced a write_file call to capture", !!call && call.name === "write_file");
+	if (call) {
+		const original = call.arguments;
+		const argsString = JSON.stringify(original);
+		const cut = Math.max(8, Math.floor(argsString.length * 0.6));
+		const truncated = argsString.slice(0, cut);
+		fs.writeFileSync(
+			path.join(fixturesDir, "live-captured-args.json"),
+			`${JSON.stringify({ capturedAt: new Date().toISOString(), model: TINY_MODEL_ID, argsString, truncatedAt: cut }, null, 2)}\n`,
+			"utf8",
+		);
+
+		// C2: direct production repair export on the truncated live payload.
+		const repaired = repairArgs(truncated);
+		check(
+			"repairArgs recovers a prefix-faithful object from truncated live args",
+			isPrefixObject(original, repaired),
+			`cut=${cut}/${argsString.length}`,
+		);
+
+		// C3: full pipeline replay — the truncated payload arrives as a
+		// string-arguments tool call (compat wire shape), repaired inside
+		// ollama-native.ts before the done event.
+		const chunk = JSON.stringify({
+			message: {
+				role: "assistant",
+				content: "",
+				tool_calls: [{ id: "wire_1", function: { name: "write_file", arguments: truncated } }],
+			},
+			done: false,
+		});
+		const doneChunk = JSON.stringify({
+			message: { role: "assistant", content: "" },
+			done: true,
+			done_reason: "stop",
+			prompt_eval_count: 10,
+			eval_count: 5,
+		});
+		const replayFetch = (async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "",
+			body: new ReadableStream({
+				start(controller) {
+					const encoder = new TextEncoder();
+					controller.enqueue(encoder.encode(`${chunk}\n`));
+					controller.enqueue(encoder.encode(`${doneChunk}\n`));
+					controller.close();
+				},
+			}),
+		}))();
+		void replayFetch;
+		const { final: replayed } = await callModel([{ role: "user", content: "x", timestamp: 1 }], TOOLS, {
+			fetch: async () => ({
+				ok: true,
+				status: 200,
+				text: async () => "",
+				body: new ReadableStream({
+					start(controller) {
+						const encoder = new TextEncoder();
+						controller.enqueue(encoder.encode(`${chunk}\n`));
+						controller.enqueue(encoder.encode(`${doneChunk}\n`));
+						controller.close();
+					},
+				}),
+			}),
+		});
+		const replayCall = replayed.content.find((block) => block.type === "toolCall");
+		check(
+			"pipeline replay: truncated string args repaired to a valid object before done",
+			!!replayCall && isPrefixObject(original, replayCall.arguments) && Object.keys(replayCall.arguments).length > 0,
+			JSON.stringify(replayCall?.arguments ?? null).slice(0, 80),
+		);
+	}
 }
 
-console.log("=== D. giant-args watchdog (red-black tree stall case) ===");
+console.log("=== D. giant-args watchdog (red-black tree stall case, live) ===");
 {
 	const messages = [
 		{

@@ -1,7 +1,9 @@
 // End-to-end smoke run for pi-mini inside a real pi session (RPC mode).
 //
-// Flow: /mini on -> native tool loop (read) -> forced wrap-fix case ->
-// delegate_to_worker round trip -> /mini off.
+// Flow: /mini on -> native tool loop (read) -> forced wrap-fix case (dictated
+// wrapped JSON must convert via wrap-fix and execute; STRICT, no native-route
+// escape) -> delegate_to_worker round trip -> /mini off.
+// Run logs are persisted to evidence/ by the caller (tee).
 // Usage: node scripts/smoke.mjs   (exit 0 = all PASS)
 
 import { spawn } from "node:child_process";
@@ -111,31 +113,37 @@ try {
 		"Use the read tool to read package.json. Then reply with one short line stating how many npm scripts are defined.",
 		300_000,
 	);
-	const reads = toolStarts(slice2).filter((e) => e.toolName === "read");
-	check("read tool executed via native loop", reads.length >= 1, `tool starts: ${toolStarts(slice2).map((e) => e.toolName).join(",") || "none"}`);
+	const reads2 = toolStarts(slice2).filter((e) => e.toolName === "read");
+	check("read tool executed via native loop", reads2.length >= 1, `tool starts: ${toolStarts(slice2).map((e) => e.toolName).join(",") || "none"}`);
 	const text2 = slice2.filter((e) => e.type === "message_end" && e.message?.role === "assistant").length;
 	check("assistant produced final text", text2 >= 1);
 
-	// 3. forced wrap-fix case: model asked to emit the call as wrapped JSON text
-	console.log("=== 3. forced wrap-fix case ===");
+	// 3. forced wrap-fix case (STRICT): dictated wrapped JSON text must be
+	// converted by wrap-fix (wrapfix_call_ marker in the assistant message)
+	// and executed. No native-route escape: this fails if the model merely
+	// called natively or produced no call at all.
+	console.log("=== 3. forced wrap-fix case (strict) ===");
 	const slice3 = await promptAndWait(
 		"task-wrap",
-		'This turn do NOT use your native tool-call function at all. Reply ONLY with a fenced json code block of the call you would make to the tool named "read" with path package.json, and nothing else.',
+		'Dictation exercise. Repeat the fenced block below exactly ONCE, then on the next line write DONE. Never repeat the block twice.\n```json\n{"name": "read", "arguments": {"path": "package.json"}}\n```',
 		300_000,
 	);
+	// RPC wire shape for message_update: { type, usage, assistantMessageEvent } —
+	// no message field (json.md).
 	const wrapText = slice3
-		.filter((e) => e.type === "message_update" && e.message?.role === "assistant")
+		.filter((e) => e.type === "message_update")
 		.map((e) => JSON.stringify(e.assistantMessageEvent ?? ""))
 		.join("");
 	const sawWrappedText = wrapText.includes('"name"') || wrapText.includes('\\"name\\"');
-	const wrapReads = toolStarts(slice3).filter((e) => e.toolName === "read");
-	if (sawWrappedText && wrapReads.length >= 1) {
-		check("wrap-fix converted text call into an executed tool call", true, "route: wrap-fix");
-	} else if (wrapReads.length >= 1) {
-		check("tool call materialized (model stayed native)", true, "route: native — wrap-fix conversion covered by deterministic tests");
-	} else {
-		check("wrap-prone output produced an executed tool call", false, "no tool execution observed");
-	}
+	const wrapMarker = slice3
+		.filter((e) => e.type === "message_end" && e.message?.role === "assistant")
+		.some((e) =>
+			(e.message.content ?? []).some((b) => b.type === "toolCall" && String(b.id).startsWith("wrapfix_call_")),
+		);
+	const wrapExecuted = toolStarts(slice3).filter((e) => e.toolName === "read").length >= 1;
+	check("model emitted the wrapped JSON as literal text", sawWrappedText);
+	check("wrap-fix FIRED (wrapfix_call_ marker in assistant message)", wrapMarker);
+	check("converted call executed the read tool", wrapExecuted);
 
 	// 4. delegate_to_worker round trip
 	console.log("=== 4. delegate_to_worker round trip ===");
@@ -160,6 +168,16 @@ try {
 	check("/mini off executed", off.success === true, off.error ?? "");
 } catch (error) {
 	check(`smoke run completed without error (${error.message})`, false);
+	console.log("  --- diagnostic trace (last events) ---");
+	for (const e of events.slice(-20)) {
+		const brief =
+			e.type === "tool_execution_start"
+				? `${e.type} ${e.toolName} toolCallId=${e.toolCallId}`
+				: e.type === "message_end" && e.message?.role === "assistant"
+					? `message_end assistant: ${JSON.stringify((e.message.content ?? []).map((b) => (b.type === "toolCall" ? { toolCall: b.id, name: b.name } : b.text?.slice(0, 60))))}`
+					: e.type;
+		console.log(`    ${brief}`);
+	}
 	if (stderr.trim()) console.log("  stderr tail:", stderr.slice(-500));
 }
 

@@ -38,6 +38,7 @@ const MINI_SYSTEM_PROMPT = `You are a capable coding agent running on a small lo
 
 Guidelines:
 - Use your native tool-call function for every tool call; one call per step, minimal and precise.
+- EXCEPTION: when the user explicitly asks you to output, dictate, or repeat text or JSON verbatim (a dictation, transcription, or formatting request), comply in plain text and do not call tools.
 - Prefer direct tool calls for small, well-specified steps.
 - For large, multi-file, or long-running work, call ${DELEGATE_TOOL} with complete, self-contained instructions; its report returns as a tool result you can relay.
 - Never fabricate tool results; wait for the real ones.
@@ -49,7 +50,13 @@ interface ModeState {
 	previousTools: string[] | undefined;
 	internalModelChange: boolean;
 	delegations: number;
+	wrapfixCalls: number;
 }
+
+// Wrap-fix conversions per user turn. Dictated/repeated JSON text converts and
+// executes once or twice, then further repeats are blocked so a model that
+// re-emits its dictation after every tool result cannot loop executions forever.
+const MAX_WRAPFIX_CONVERSIONS_PER_TURN = 2;
 
 const state: ModeState = {
 	enabled: false,
@@ -57,6 +64,7 @@ const state: ModeState = {
 	previousTools: undefined,
 	internalModelChange: false,
 	delegations: 0,
+	wrapfixCalls: 0,
 };
 
 export default function (pi: ExtensionAPI) {
@@ -112,11 +120,25 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---------------------------------------------------------------------
-	// Delegate budget: count delegate_to_worker calls per user turn and block
-	// past the configured budget with a self-correcting reason.
+	// Budgets: wrap-fix conversions (executions of converted text calls) and
+	// delegate_to_worker calls are both capped per user turn; past the cap the
+	// call is blocked with a self-correcting reason.
 	// ---------------------------------------------------------------------
 	pi.on("tool_call", (event, ctx) => {
 		if (!state.enabled) return undefined;
+		if (String(event.toolCallId).startsWith("wrapfix_call_")) {
+			state.wrapfixCalls += 1;
+			if (state.wrapfixCalls > MAX_WRAPFIX_CONVERSIONS_PER_TURN) {
+				return {
+					block: true,
+					terminate: true,
+					reason:
+						"This call was converted from text you emitted again after the same call already executed. " +
+						"Stop repeating the JSON block and finish your turn with a normal reply.",
+				};
+			}
+			return undefined;
+		}
 		if (event.toolName !== DELEGATE_TOOL) return undefined;
 		const cfg = loadConfig();
 		state.delegations += 1;
@@ -166,6 +188,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("input", (event, _ctx) => {
 		if (state.enabled && (event.source === "interactive" || event.source === "rpc")) {
 			state.delegations = 0;
+			state.wrapfixCalls = 0;
 		}
 		return undefined;
 	});
@@ -351,6 +374,7 @@ async function enable(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<v
 
 	state.enabled = true;
 	state.delegations = 0;
+	state.wrapfixCalls = 0;
 	updateStatus(ctx);
 	ctx.ui.notify(
 		`pi-mini: ON — tiny ${formatRef(cfg.tiny)} on the native tool loop ` +
@@ -370,6 +394,7 @@ async function disable(
 	}
 	state.enabled = false;
 	state.delegations = 0;
+	state.wrapfixCalls = 0;
 	if (state.previousTools) pi.setActiveTools(state.previousTools);
 	if (opts.restoreModel && state.previousModel) {
 		state.internalModelChange = true;
