@@ -1,0 +1,10 @@
+{
+  "name": "pi-mini",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "pi extension: tiny local LLM orchestrator that delegates all tool work to a large model",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
