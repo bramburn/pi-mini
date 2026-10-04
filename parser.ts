@@ -10,7 +10,12 @@ const FENCED_BLOCK_RE = /```(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi;
 const TASK_KEYS = ["task", "instruction", "prompt", "content", "description", "task_description"];
 const NESTED_KEYS = ["arguments", "parameters", "args", "input"];
 
-function parseTolerantJson(raw: string): Record<string, unknown> | undefined {
+/**
+ * Trim to the first object open brace, repair truncated strings/braces, and
+ * cut any trailing junk after the first balanced object. Exported so the
+ * wrapfix tool-call repair layer shares exactly this tolerant-JSON core.
+ */
+export function balanceJsonBraces(raw: string): string | undefined {
 	let cleaned = raw.trim();
 	const firstBrace = cleaned.indexOf("{");
 	if (firstBrace === -1) return undefined;
@@ -19,6 +24,7 @@ function parseTolerantJson(raw: string): Record<string, unknown> | undefined {
 	let open = 0;
 	let inString = false;
 	let escaped = false;
+	let closeAt: number | undefined;
 	for (let i = 0; i < cleaned.length; i++) {
 		const ch = cleaned[i];
 		if (ch === "\\" && !escaped) {
@@ -29,7 +35,10 @@ function parseTolerantJson(raw: string): Record<string, unknown> | undefined {
 			inString = !inString;
 		} else if (!inString) {
 			if (ch === "{") open++;
-			else if (ch === "}") open--;
+			else if (ch === "}") {
+				open--;
+				if (open === 0 && closeAt === undefined) closeAt = i + 1;
+			}
 		}
 		escaped = false;
 	}
@@ -38,6 +47,12 @@ function parseTolerantJson(raw: string): Record<string, unknown> | undefined {
 		cleaned += "}";
 		open--;
 	}
+	return closeAt !== undefined ? cleaned.slice(0, closeAt) : cleaned;
+}
+
+export function parseTolerantJson(raw: string): Record<string, unknown> | undefined {
+	const cleaned = balanceJsonBraces(raw);
+	if (!cleaned) return undefined;
 
 	try {
 		const parsed: unknown = JSON.parse(cleaned);

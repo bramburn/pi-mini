@@ -3,45 +3,51 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type { Model } from "@earendil-works/pi-ai";
+import { createProvider, Type, type Model } from "@earendil-works/pi-ai";
 import { runWorker } from "./delegate.ts";
-import { extractDelegate, stripDelegateBlocks } from "./parser.ts";
+import { stripDelegateBlocks } from "./parser.ts";
 import { pickModelRef } from "./picker.ts";
+import { ollamaNativeApi } from "./ollama-native.ts";
 import {
+	DELEGATE_TOOL,
 	formatRef,
 	loadConfig,
 	OLLAMA_BASE_URL,
 	saveConfig,
+	TINY_CONTEXT_WINDOW,
+	TINY_MAX_TOKENS,
 	TINY_MODEL_ID,
 	TINY_PROVIDER,
+	toolsForMode,
 } from "./settings.ts";
+import { stripToolCallSpans } from "./wrapfix.ts";
 
 /**
- * pi-mini: run a tiny local LLM as the session model with zero tools and a
- * minimal system prompt. It answers directly or delegates work by emitting a
- * ```json {"task": "..."} block, which this extension executes via a pi
- * subprocess running the configured large model with the full session
- * transcript as context. Toggling off restores the previous model and tools.
+ * pi-mini: run a tiny local LLM as the session model with pi's native agentic
+ * tool loop (read/edit/find/grep/bash) plus a delegate_to_worker escape hatch
+ * that hands large work to a configured large model (full pi worker subprocess).
+ *
+ * The tiny model speaks Ollama's native /api/chat through ollama-native.ts,
+ * which enforces think:false and repairs text-wrapped/truncated tool calls back
+ * into real toolCall blocks (the json-call/tool-call wrap-fix), so the standard
+ * tool_use -> tool_result -> continue loop works even when the model degrades.
+ * Toggling off restores the previous model and tools.
  */
 
-const MAX_DELEGATIONS_PER_TURN = 8;
+const MINI_SYSTEM_PROMPT = `You are a capable coding agent running on a small local model. You complete tasks with your tools (read, edit, find, grep, bash) and, when needed, by delegating to a powerful worker.
 
-const MINI_SYSTEM_PROMPT = `You are an orchestrator agent running on a small local language model. You have no tools. You cannot read files, edit files, or run commands yourself.
-
-For each user request decide:
-1. If it needs no actions (questions, discussion, explanations), answer directly and briefly.
-2. If it requires any action (reading files, writing or editing code, running commands, searching, or anything you cannot answer from this conversation alone), delegate it by replying with exactly one fenced code block and no other text:
-\`\`\`json
-{ "task": "complete, self-contained instructions for the worker" }
-\`\`\`
-The worker is a powerful agent with full tool access and this entire conversation as context. The worker result is delivered back to you as a user message; relay or summarize it for the user. Never invent worker results.`;
+Guidelines:
+- Use your native tool-call function for every tool call; one call per step, minimal and precise.
+- Prefer direct tool calls for small, well-specified steps.
+- For large, multi-file, or long-running work, call ${DELEGATE_TOOL} with complete, self-contained instructions; its report returns as a tool result you can relay.
+- Never fabricate tool results; wait for the real ones.
+- When the work is done, reply with a brief summary of what changed.`;
 
 interface ModeState {
 	enabled: boolean;
 	previousModel: Model<any> | undefined;
 	previousTools: string[] | undefined;
 	internalModelChange: boolean;
-	pendingTask: string | undefined;
 	delegations: number;
 }
 
@@ -50,11 +56,52 @@ const state: ModeState = {
 	previousModel: undefined,
 	previousTools: undefined,
 	internalModelChange: false,
-	pendingTask: undefined,
 	delegations: 0,
 };
 
 export default function (pi: ExtensionAPI) {
+	// ---------------------------------------------------------------------
+	// Provider + delegate tool registration (also refreshed on /mini on so
+	// think toggles in config take effect).
+	// ---------------------------------------------------------------------
+	registerTinyProvider(pi, loadConfig());
+
+	pi.registerTool({
+		name: DELEGATE_TOOL,
+		label: "Delegate to worker",
+		description:
+			"Delegate a large or complex task to a powerful worker model with full tool access. " +
+			"The worker sees this entire conversation; its final report is returned as the tool result. " +
+			"Use for multi-file, long-running, or hard tasks; prefer your own tools for small steps.",
+		parameters: Type.Object({
+			task: Type.String({ description: "Complete, self-contained instructions for the worker" }),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const cfg = loadConfig();
+			if (!cfg.large) {
+				return {
+					content: [{ type: "text", text: "[worker failed] no large model configured, run /mini large" }],
+					details: { ok: false },
+					isError: true,
+				};
+			}
+			const result = await runWorker({
+				large: cfg.large,
+				task: params.task,
+				entries: ctx.sessionManager.getEntries(),
+				cwd: ctx.cwd,
+				signal,
+			});
+			return {
+				content: [
+					{ type: "text", text: result.ok ? `[worker result]\n${result.text}` : `[worker failed]\n${result.text}` },
+				],
+				details: { ok: result.ok },
+				isError: !result.ok,
+			};
+		},
+	});
+
 	// ---------------------------------------------------------------------
 	// Per-turn system prompt replacement while mini mode is active.
 	// ---------------------------------------------------------------------
@@ -65,90 +112,61 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---------------------------------------------------------------------
-	// Capture delegate blocks from assistant text, and hide the raw block
-	// from the transcript (message_end can replace the finalized message).
+	// Delegate budget: count delegate_to_worker calls per user turn and block
+	// past the configured budget with a self-correcting reason.
+	// ---------------------------------------------------------------------
+	pi.on("tool_call", (event, ctx) => {
+		if (!state.enabled) return undefined;
+		if (event.toolName !== DELEGATE_TOOL) return undefined;
+		const cfg = loadConfig();
+		state.delegations += 1;
+		updateStatus(ctx);
+		if (state.delegations > cfg.delegateBudget) {
+			return {
+				block: true,
+				reason:
+					`The ${DELEGATE_TOOL} budget for this turn (${cfg.delegateBudget}) is reached. ` +
+					"Finish with your own tools and give the user a brief status summary.",
+			};
+		}
+		updateStatus(ctx, `worker running (delegation #${state.delegations})…`);
+		return undefined;
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!state.enabled) return;
+		updateStatus(ctx);
+	});
+
+	// ---------------------------------------------------------------------
+	// Display cleanup only: strip stray delegate blocks and any text-wrapped
+	// tool calls that the stream-level wrap-fix did not convert. Tool-call
+	// semantics live in ollama-native.ts now.
 	// ---------------------------------------------------------------------
 	pi.on("message_end", (event, ctx) => {
 		if (!state.enabled) return undefined;
 		if (event.message.role !== "assistant") return undefined;
-		const text = event.message.content
-			.filter((p): p is { type: "text"; text: string } => p.type === "text")
-			.map((p) => p.text)
-			.join("\n");
-		const request = extractDelegate(text);
-		if (!request) return undefined;
-
-		state.pendingTask = request.task;
-		const cleaned = stripDelegateBlocks(text);
-		const nonText = event.message.content.filter((p) => p.type !== "text");
-		const content = cleaned
-			? [{ type: "text" as const, text: cleaned }, ...nonText]
-			: nonText.length > 0
-				? nonText
-				: [{ type: "text" as const, text: "(delegated to the worker model)" }];
-		return { message: { ...event.message, content } };
+		const activeTools = new Set(pi.getActiveTools());
+		let changed = false;
+		const content = event.message.content.map((part) => {
+			if (part.type !== "text") return part;
+			const cleaned = stripToolCallSpans(stripDelegateBlocks(part.text), activeTools);
+			if (cleaned !== part.text) {
+				changed = true;
+				return { ...part, text: cleaned };
+			}
+			return part;
+		});
+		return changed ? { message: { ...event.message, content } } : undefined;
 	});
 
 	// ---------------------------------------------------------------------
-	// After the orchestrator settles, run the delegation if one was parsed.
-	// ---------------------------------------------------------------------
-	pi.on("agent_settled", async (_event, ctx) => {
-		if (!state.enabled) return;
-		const task = state.pendingTask;
-		state.pendingTask = undefined;
-		if (!task) return;
-
-		if (state.delegations >= MAX_DELEGATIONS_PER_TURN) {
-			ctx.ui.notify(`pi-mini: delegation limit (${MAX_DELEGATIONS_PER_TURN}) reached`, "warning");
-			pi.sendUserMessage(
-				"[pi-mini] The delegation limit for this turn was reached. Stop delegating and give the user " +
-					"a brief status summary of what has been done so far.",
-			);
-			return;
-		}
-
-		const cfg = loadConfig();
-		if (!cfg.large) {
-			ctx.ui.notify("pi-mini: no large model configured, run /mini large", "error");
-			return;
-		}
-
-		state.delegations += 1;
-		updateStatus(ctx, `worker running (delegation #${state.delegations})…`);
-		try {
-			const result = await runWorker({
-				large: cfg.large,
-				task,
-				entries: ctx.sessionManager.getEntries(),
-				cwd: ctx.cwd,
-				signal: ctx.signal,
-			});
-			updateStatus(ctx);
-			pi.sendUserMessage(
-				result.ok
-					? `[worker result]\n${result.text}`
-					: `[worker failed]\n${result.text}\nTell the user the worker failed and summarize what you know.`,
-			);
-		} catch (err) {
-			updateStatus(ctx);
-			ctx.ui.notify(`pi-mini: worker error: ${String(err)}`, "error");
-		}
-	});
-
-	// ---------------------------------------------------------------------
-	// Reset the per-turn delegation counter on real user input.
+	// Reset the per-turn delegate budget on real user input.
 	// ---------------------------------------------------------------------
 	pi.on("input", (event, _ctx) => {
 		if (state.enabled && (event.source === "interactive" || event.source === "rpc")) {
 			state.delegations = 0;
 		}
-		return undefined;
-	});
-
-	// Drop any half-captured delegate block when a new turn begins (e.g. the
-	// previous turn was aborted before agent_settled could consume it).
-	pi.on("turn_start", (_event, _ctx) => {
-		state.pendingTask = undefined;
 		return undefined;
 	});
 
@@ -168,7 +186,7 @@ export default function (pi: ExtensionAPI) {
 	// /mini command
 	// ---------------------------------------------------------------------
 	pi.registerCommand("mini", {
-		description: "Mini orchestrator mode: tiny local LLM delegates tool work to a large model",
+		description: "Mini mode: tiny local LLM on the native tool loop, delegating large work to a worker",
 		getArgumentCompletions: (prefix) => {
 			const candidates = ["on", "off", "tiny", "large", "status"];
 			return candidates
@@ -205,11 +223,11 @@ export default function (pi: ExtensionAPI) {
 function completionDescription(candidate: string): string {
 	switch (candidate) {
 		case "on":
-			return "Enable mini mode (tiny orchestrator model)";
+			return "Enable mini mode (tiny model on the native tool loop)";
 		case "off":
 			return "Disable mini mode, restore previous model and tools";
 		case "tiny":
-			return "Pick the tiny orchestrator model";
+			return "Pick the tiny model";
 		case "large":
 			return "Pick the large worker model";
 		case "status":
@@ -217,6 +235,45 @@ function completionDescription(candidate: string): string {
 		default:
 			return "";
 	}
+}
+
+/**
+ * Register (or refresh) the native Ollama provider that backs the tiny model.
+ * Distinct provider id so the user's own "ollama" catalogue is never replaced.
+ */
+function registerTinyProvider(pi: ExtensionAPI, cfg: ReturnType<typeof loadConfig>): void {
+	const provider = createProvider({
+		id: TINY_PROVIDER,
+		name: "Ollama (pi-mini)",
+		baseUrl: OLLAMA_BASE_URL,
+		auth: {
+			apiKey: {
+				name: "Ollama local server",
+				resolve: () => ({ auth: { apiKey: "ollama" }, source: "local Ollama server" }),
+			},
+		},
+		models: [
+			{
+				id: TINY_MODEL_ID,
+				name: "Granite 4.2 8B (pi-mini orchestrator)",
+				api: "ollama-native",
+				provider: TINY_PROVIDER,
+				baseUrl: OLLAMA_BASE_URL,
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: TINY_CONTEXT_WINDOW,
+				maxTokens: TINY_MAX_TOKENS,
+			},
+		],
+		api: ollamaNativeApi({ baseUrl: OLLAMA_BASE_URL, think: cfg.think }),
+	});
+	try {
+		pi.unregisterProvider(TINY_PROVIDER);
+	} catch {
+		// first registration: nothing to remove
+	}
+	pi.registerProvider(provider);
 }
 
 function isTinyModel(ctx: ExtensionContext): boolean {
@@ -230,7 +287,8 @@ function updateStatus(ctx: ExtensionContext, override?: string): void {
 		return;
 	}
 	const cfg = loadConfig();
-	const base = `MINI ${shortId(cfg.tiny.modelId)} → ${cfg.large ? shortId(cfg.large.modelId) : "?"}`;
+	const think = cfg.think ? ", think" : "";
+	const base = `MINI ${shortId(cfg.tiny.modelId)} → ${cfg.large ? shortId(cfg.large.modelId) : "?"} (${cfg.toolsMode}${think})`;
 	ctx.ui.setStatus("pi-mini", override ?? base);
 }
 
@@ -254,8 +312,18 @@ async function enable(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<v
 		ctx.ui.notify(`pi-mini: large worker defaults to current model (${formatRef(cfg.large)})`, "info");
 	}
 
-	const tinyModel = resolveTinyModel(pi, ctx);
-	if (!tinyModel) return;
+	// Refresh the provider so a changed think flag takes effect, then resolve
+	// the configured tiny model (custom refs resolve through the registry).
+	registerTinyProvider(pi, cfg);
+	let tinyModel = ctx.modelRegistry.find(cfg.tiny.provider, cfg.tiny.modelId);
+	if (!tinyModel && cfg.tiny.provider === TINY_PROVIDER && cfg.tiny.modelId === TINY_MODEL_ID) {
+		ctx.ui.notify("pi-mini: default tiny model not found in the registry", "error");
+		return;
+	}
+	if (!tinyModel) {
+		ctx.ui.notify(`pi-mini: tiny model ${formatRef(cfg.tiny)} not found in the model registry, run /mini tiny`, "error");
+		return;
+	}
 	const largeModel = ctx.modelRegistry.find(cfg.large.provider, cfg.large.modelId);
 	if (!largeModel) {
 		ctx.ui.notify(`pi-mini: large model ${formatRef(cfg.large)} not found, run /mini large`, "error");
@@ -276,14 +344,17 @@ async function enable(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<v
 		return;
 	}
 
-	pi.setActiveTools([]);
+	// Never an empty tool set: the tiny model drives pi's native tool loop.
+	const allNames = pi.getAllTools().map((tool) => tool.name);
+	const wanted = toolsForMode(cfg.toolsMode, allNames);
+	pi.setActiveTools([...new Set([...wanted, DELEGATE_TOOL])]);
+
 	state.enabled = true;
 	state.delegations = 0;
-	state.pendingTask = undefined;
 	updateStatus(ctx);
 	ctx.ui.notify(
-		`pi-mini: ON — orchestrator ${formatRef(cfg.tiny)}, worker ${formatRef(cfg.large)}, zero tools, ` +
-			`delegation via json block`,
+		`pi-mini: ON — tiny ${formatRef(cfg.tiny)} on the native tool loop ` +
+			`(${[...new Set([...wanted, DELEGATE_TOOL])].join(", ")}), worker ${formatRef(cfg.large)}, think ${cfg.think ? "on" : "off"}`,
 		"info",
 	);
 }
@@ -298,7 +369,6 @@ async function disable(
 		return;
 	}
 	state.enabled = false;
-	state.pendingTask = undefined;
 	state.delegations = 0;
 	if (state.previousTools) pi.setActiveTools(state.previousTools);
 	if (opts.restoreModel && state.previousModel) {
@@ -329,7 +399,11 @@ async function configureModel(
 	saveConfig(cfg);
 
 	if (which === "tiny" && state.enabled) {
-		const model = ctx.modelRegistry.find(chosen.provider, chosen.modelId);
+		let model = ctx.modelRegistry.find(chosen.provider, chosen.modelId);
+		if (!model && chosen.provider === TINY_PROVIDER) {
+			registerTinyProvider(pi, cfg);
+			model = ctx.modelRegistry.find(chosen.provider, chosen.modelId);
+		}
 		if (model) {
 			state.internalModelChange = true;
 			try {
@@ -348,55 +422,11 @@ function reportStatus(ctx: ExtensionCommandContext): void {
 	const lines = [
 		`mini mode: ${state.enabled ? "ON" : "OFF"}`,
 		`tiny: ${formatRef(cfg.tiny)}`,
-		`large: ${cfg.large ? formatRef(cfg.large) : "(unset, defaults to current model on /mini on)"}`,
+		`large: ${cfg.large ? formatRef(cfg.large): "(unset, defaults to current model on /mini on)"}`,
+		`think: ${cfg.think ? "on" : "off"}`,
+		`tools: ${cfg.toolsMode}`,
+		`delegate budget: ${cfg.delegateBudget}/turn`,
 	];
 	if (state.enabled) lines.push(`delegations this turn: ${state.delegations}`);
 	ctx.ui.notify(lines.join("\n"), "info");
-}
-
-function resolveTinyModel(pi: ExtensionAPI, ctx: ExtensionContext): Model<any> | undefined {
-	const cfg = loadConfig();
-	const existing = ctx.modelRegistry.find(cfg.tiny.provider, cfg.tiny.modelId);
-	if (existing) return existing;
-
-	if (cfg.tiny.provider !== TINY_PROVIDER || cfg.tiny.modelId !== TINY_MODEL_ID) {
-		ctx.ui.notify(`pi-mini: tiny model ${formatRef(cfg.tiny)} not found in the model registry`, "error");
-		return undefined;
-	}
-
-	// The default tiny model is not configured yet. Only auto-register when no
-	// ollama provider exists at all, because registering models replaces the
-	// provider's catalogue.
-	const hasOllamaProvider = ctx.modelRegistry.getAll().some((m) => m.provider === TINY_PROVIDER);
-	if (hasOllamaProvider) {
-		ctx.ui.notify(
-			`pi-mini: add this to ~/.pi/agent/models.json providers.ollama.models:\n` +
-				`{ "id": "${TINY_MODEL_ID}" }`,
-			"error",
-		);
-		return undefined;
-	}
-	pi.registerProvider(TINY_PROVIDER, {
-		name: "Ollama (pi-mini)",
-		baseUrl: OLLAMA_BASE_URL,
-		apiKey: "ollama",
-		api: "openai-completions",
-		models: [
-			{
-				id: TINY_MODEL_ID,
-				name: "Qwen2.5-Coder-7B abliterated Q4_K_M (pi-mini orchestrator)",
-				reasoning: false,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 32768,
-				maxTokens: 8192,
-			},
-		],
-	});
-	const registered = ctx.modelRegistry.find(TINY_PROVIDER, TINY_MODEL_ID);
-	if (!registered) {
-		ctx.ui.notify("pi-mini: failed to register the ollama tiny model", "error");
-		return undefined;
-	}
-	return registered;
 }
