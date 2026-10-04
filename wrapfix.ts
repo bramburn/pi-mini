@@ -24,6 +24,16 @@ const ARGS_KEYS = ["arguments", "args", "parameters", "input"];
 const WRAPPER_KEYS = ["function", ...ARGS_KEYS];
 const MAX_DETECT_ATTEMPTS = 5;
 
+/** Convert/strip a wrapped call only when the message is essentially just the
+ * call; more surrounding prose means documentation or dictation, not a
+ * degraded tool call. */
+export const MAX_WRAPFIX_RESIDUAL_CHARS = 200;
+
+/** Text remaining after removing the wrapped call's span (trimmed). */
+export function wrappedResidual(text: string, call: WrappedToolCall): string {
+	return (text.slice(0, call.start) + text.slice(call.end)).trim();
+}
+
 /**
  * Tolerant repair of a tool-call arguments string: trims to the first balanced
  * JSON object (closing truncated strings/braces and cutting trailing junk).
@@ -128,8 +138,13 @@ export function detectToolCall(text: string, knownTools: ReadonlySet<string>): W
 
 	const trimmed = text.trim();
 	if (trimmed.startsWith("{")) {
+		const cleaned = balanceJsonBraces(trimmed);
 		const call = callFromObject(parseTolerantJson(trimmed), knownTools);
-		if (call) return toWrapped(call, 0, text.length);
+		if (call) {
+			const start = text.length - text.trimStart().length;
+			const end = cleaned ? Math.min(start + cleaned.length, text.length) : text.length;
+			return toWrapped(call, start, end);
+		}
 	}
 
 	FENCE_OPEN_RE.lastIndex = 0;
@@ -152,12 +167,14 @@ export function detectToolCall(text: string, knownTools: ReadonlySet<string>): W
 	return undefined;
 }
 
-/** Remove every detected wrapped tool call from text, keeping surrounding prose. */
+/** Remove every detected wrapped tool call from text, keeping surrounding prose.
+ * Calls buried in prose are documented examples and are kept. */
 export function stripToolCallSpans(text: string, knownTools: ReadonlySet<string>): string {
 	let result = text;
 	for (let i = 0; i < MAX_DETECT_ATTEMPTS; i++) {
 		const call = detectToolCall(result, knownTools);
 		if (!call) break;
+		if (wrappedResidual(result, call).length > MAX_WRAPFIX_RESIDUAL_CHARS) break;
 		result = (result.slice(0, call.start) + result.slice(call.end)).trim();
 	}
 	return result;

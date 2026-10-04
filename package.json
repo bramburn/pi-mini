@@ -1,10 +1,11 @@
 {
 	"name": "pi-mini",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"private": true,
 	"type": "module",
-	"description": "pi extension: tiny local LLM orchestrator that delegates all tool work to a large model",
+	"description": "pi extension: tiny local LLM on pi's native tool loop with json/tool-call wrap-fix, delegating large work to a worker model",
 	"scripts": {
+		"pretest": "node scripts/ensure-test-deps.mjs",
 		"test": "node --test"
 	},
 	"pi": {

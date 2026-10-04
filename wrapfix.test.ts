@@ -127,6 +127,13 @@ describe("stripToolCallSpans", () => {
 		assert.equal(stripToolCallSpans(text, TOOLS), "I will read the file.\n\nDone.");
 	});
 
+	test("keeps documented examples buried in prose", () => {
+		const text =
+			'Example:\n```json\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n```\n' +
+			"explanation ".repeat(30);
+		assert.equal(stripToolCallSpans(text, TOOLS), text);
+	});
+
 	test("leaves ordinary code fences alone", () => {
 		const text = "Snippet:\n```python\nprint('hi')\n```";
 		assert.equal(stripToolCallSpans(text, TOOLS), text);

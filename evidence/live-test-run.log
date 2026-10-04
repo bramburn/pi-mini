@@ -2,7 +2,7 @@
   PASS  step 1 call read_file has parseable args
   PASS  step 2 call write_file has parseable args
   PASS  loop made at least 2 tool calls across steps — 2 calls
-  PASS  loop terminated with final text, no trailing call — The word count of notes.txt is written to out.txt.
+  PASS  loop terminated with final text, no trailing call — The count of words in notes.txt (7 words) was written to out.txt.
 === B. forced wrap-fix: dictated wrapped JSON converts + executes (live) ===
   PASS  model emitted the wrapped JSON as literal text
   PASS  wrap-fix fired (wrapfix_call_ marker) with stopReason toolUse — id=wrapfix_call_1 stop=toolUse
@@ -10,9 +10,9 @@
   PASS  converted call executes against the tool
 === C. args repair on live-captured output, truncated at the wire boundary ===
   PASS  live model produced a write_file call to capture
-  PASS  repairArgs recovers a prefix-faithful object from truncated live args — cut=137/229
-  PASS  pipeline replay: truncated string args repaired to a valid object before done — {"path":"story.txt","content":"A robot woke up in a forest and found a broken fl
+  PASS  repairArgs recovers a prefix-faithful object from truncated live args — cut=128/214
+  PASS  pipeline replay: truncated string args repaired to a valid object before done — {"path":"story.txt","content":"The robot woke up with no memory of its purpose. 
 === D. giant-args watchdog (red-black tree stall case, live) ===
-  PASS  watchdog aborted the stall (no recoverable call) — generation stalled (no output for 45s) with no recoverable tool call in 48.6s
+  PASS  watchdog aborted the stall (no recoverable call) — generation stalled (no output for 45s) with no recoverable tool call in 49.1s
 
 ALL SCENARIOS PASS

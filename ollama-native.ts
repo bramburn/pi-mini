@@ -30,10 +30,13 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import { AssistantMessageEventStream, calculateCost } from "@earendil-works/pi-ai";
-import { detectToolCall, repairArgs } from "./wrapfix.ts";
+import { detectToolCall, MAX_WRAPFIX_RESIDUAL_CHARS, repairArgs, wrappedResidual } from "./wrapfix.ts";
 
 export const DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434";
 export const DEFAULT_STALL_TIMEOUT_MS = 90_000;
+
+/** Monotonic so wrapfix call ids never collide across messages/turns in replayed history. */
+let wrapfixCallSeq = 0;
 
 export interface OllamaNativeApiOptions {
 	/** Ollama server root (no /v1 suffix). Default http://localhost:11434 */
@@ -252,9 +255,11 @@ export function ollamaNativeApi(opts?: OllamaNativeApiOptions): ProviderStreams 
 				const text = textBlock?.text ?? "";
 				const wrapped = detectToolCall(text, knownTools);
 				if (!wrapped) return;
+				if (wrappedResidual(text, wrapped).length > MAX_WRAPFIX_RESIDUAL_CHARS) return; // documentation/example
 				const args = stalled ? {} : wrapped.arguments;
+				wrapfixCallSeq += 1;
 				addToolCall(
-					{ id: `wrapfix_call_${toolCallBlocks.length + 1}`, function: { name: wrapped.name, arguments: args } },
+					{ id: `wrapfix_call_${wrapfixCallSeq}`, function: { name: wrapped.name, arguments: args } },
 					toolCallBlocks.length + 1,
 					args,
 				);
@@ -280,21 +285,43 @@ export function ollamaNativeApi(opts?: OllamaNativeApiOptions): ProviderStreams 
 				const nativeTools = buildNativeTools(context.tools);
 				if (nativeTools) body.tools = nativeTools;
 				const requestOptions: Record<string, unknown> = {};
-				if (options?.maxTokens !== undefined) requestOptions.num_predict = options.maxTokens;
+				// Unbounded generation is the runaway failure mode: always cap output.
+				requestOptions.num_predict = options?.maxTokens ?? model.maxTokens;
+				// Pin the context window: Ollama silently defaults to a small num_ctx
+				// and drops the oldest context when the transcript outgrows it.
+				if (model.contextWindow > 0) requestOptions.num_ctx = model.contextWindow;
 				if (options?.temperature !== undefined) requestOptions.temperature = options.temperature;
 				if (Object.keys(requestOptions).length > 0) body.options = requestOptions;
 
 				const controller = new AbortController();
 				const onOuterAbort = () => controller.abort();
-				options?.signal?.addEventListener("abort", onOuterAbort, { once: true });
+				if (options?.signal?.aborted) controller.abort();
+				else options?.signal?.addEventListener("abort", onOuterAbort, { once: true });
 
 				try {
-					const response = await (options?.fetch ?? globalThis.fetch)(`${baseUrl}/api/chat`, {
+					const doFetch = options?.fetch ?? globalThis.fetch;
+					const request = doFetch(`${baseUrl}/api/chat`, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify(body),
 						signal: controller.signal,
 					});
+					// Optional connect/first-byte ceiling. The stall watchdog covers idle
+					// streaming; cold model loads can legitimately take ~90s before the
+					// first byte, so there is no default deadline here.
+					let connectTimer: ReturnType<typeof setTimeout> | undefined;
+					const response = await (options?.timeoutMs
+						? Promise.race([
+								request,
+								new Promise<never>((_, reject) => {
+									connectTimer = setTimeout(() => {
+										controller.abort();
+										reject(new Error(`Ollama request timed out after ${options.timeoutMs}ms`));
+									}, options.timeoutMs);
+								}),
+							])
+						: request);
+					clearTimeout(connectTimer);
 					if (!response.ok || !response.body) {
 						const detail = (await response.text().catch(() => "")).slice(0, 300);
 						throw new Error(`Ollama /api/chat ${response.status}: ${detail}`);
@@ -313,19 +340,26 @@ export function ollamaNativeApi(opts?: OllamaNativeApiOptions): ProviderStreams 
 						const timeout = new Promise<"stall">((resolve) => {
 							timer = setTimeout(() => resolve("stall"), stallTimeoutMs);
 						});
-						// A pending read() rejects after controller.abort() — swallow it so the
-						// losing side of the race can never become an unhandled rejection.
-						const read = reader
-							.read()
-							.catch((): ReadableStreamReadResult<Uint8Array> => ({ done: true, value: undefined }));
-						const raced = await Promise.race([read, timeout]);
-						clearTimeout(timer);
-						if (raced === "stall") {
-							stalled = true;
-							controller.abort();
-							return { done: true, value: undefined };
+						const read = reader.read().catch((error: unknown): ReadableStreamReadResult<Uint8Array> => {
+							// Expected after our own abort (stall watchdog or caller abort).
+							// Anything else is a real transport failure and must surface as
+							// an error, never as a clean-looking truncated message.
+							if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+								return { done: true, value: undefined };
+							}
+							throw error;
+						});
+						try {
+							const raced = await Promise.race([read, timeout]);
+							if (raced === "stall") {
+								stalled = true;
+								controller.abort();
+								return { done: true, value: undefined };
+							}
+							return raced;
+						} finally {
+							clearTimeout(timer);
 						}
-						return raced;
 					};
 
 					const processLine = (line: string): void => {
@@ -367,6 +401,12 @@ export function ollamaNativeApi(opts?: OllamaNativeApiOptions): ProviderStreams 
 					repairPass(stalled);
 				} finally {
 					options?.signal?.removeEventListener("abort", onOuterAbort);
+				}
+
+				if (options?.signal?.aborted) {
+					// User aborted mid-stream: never report a truncated message as a
+					// clean stop.
+					throw Object.assign(new Error("generation aborted"), { name: "AbortError" });
 				}
 
 				output.usage.cost = calculateCost(model, output.usage);

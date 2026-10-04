@@ -335,6 +335,16 @@ async function enable(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<v
 		ctx.ui.notify(`pi-mini: large worker defaults to current model (${formatRef(cfg.large)})`, "info");
 	}
 
+	// Warn when the tiny model skips the native pipeline (no think:false,
+	// wrap-fix, or watchdog outside the ollama-mini provider).
+	if (cfg.tiny.provider !== TINY_PROVIDER) {
+		ctx.ui.notify(
+			"pi-mini: note — think:false, wrap-fix, and the stall watchdog only apply to ollama-mini models; " +
+				`${formatRef(cfg.tiny)} runs on its provider's stock API`,
+			"warning",
+		);
+	}
+
 	// Refresh the provider so a changed think flag takes effect, then resolve
 	// the configured tiny model (custom refs resolve through the registry).
 	registerTinyProvider(pi, cfg);
@@ -422,6 +432,14 @@ async function configureModel(
 	if (which === "tiny") cfg.tiny = chosen;
 	else cfg.large = chosen;
 	saveConfig(cfg);
+
+	if (which === "tiny" && chosen.provider !== TINY_PROVIDER) {
+		ctx.ui.notify(
+			"pi-mini: note — think:false, wrap-fix, and the stall watchdog only apply to ollama-mini models; " +
+				`${formatRef(chosen)} runs on its provider's stock API`,
+			"warning",
+		);
+	}
 
 	if (which === "tiny" && state.enabled) {
 		let model = ctx.modelRegistry.find(chosen.provider, chosen.modelId);

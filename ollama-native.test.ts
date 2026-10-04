@@ -82,11 +82,19 @@ function fakeFetch(chunks: string[], stallAfter = false) {
 async function run(
 	context: Context,
 	chunks: string[],
-	opts: { stallAfter?: boolean; stallTimeoutMs?: number } = {},
+	opts: {
+		stallAfter?: boolean;
+		stallTimeoutMs?: number;
+		fetch?: typeof globalThis.fetch;
+		signal?: AbortSignal;
+	} = {},
 ) {
-	const { fetchImpl, state } = fakeFetch(chunks, opts.stallAfter ?? false);
+	const { fetchImpl, state } = opts.fetch
+		? { fetchImpl: opts.fetch, state: { request: null } }
+		: fakeFetch(chunks, opts.stallAfter ?? false);
 	const stream = ollamaNativeApi({ stallTimeoutMs: opts.stallTimeoutMs ?? 200 }).streamSimple(model, context, {
 		fetch: fetchImpl,
+		signal: opts.signal,
 	} as never);
 	const events: AssistantMessageEvent[] = [];
 	for await (const event of stream) events.push(event);
@@ -119,6 +127,8 @@ describe("ollamaNativeApi", () => {
 			messages.map((m) => m.role),
 			["system", "user"],
 		);
+		// output is always capped and the context window is pinned (H1/H2)
+		assert.deepEqual(request?.body.options, { num_predict: 8192, num_ctx: 131072 });
 	});
 
 	test("assistant tool calls and tool results are replayed in native shape", async () => {
@@ -222,6 +232,65 @@ describe("ollamaNativeApi", () => {
 		const errorEvent = events.find((event) => event.type === "error");
 		assert.ok(errorEvent && errorEvent.type === "error");
 		assert.equal(errorEvent.reason, "error");
+	});
+
+	test("wrapped call buried in prose is left as text (documentation guard)", async () => {
+		const context = makeContext([{ role: "user", content: "Show me an example", timestamp: 1 }] as Message[]);
+		const prose =
+			'Here is an example of a tool call you might write:\n```json\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n```\nAs you can see, it targets a path. ' +
+			"x".repeat(300);
+		const { final } = await run(context, [textChunk(prose), doneChunk("stop")]);
+		assert.equal(final.stopReason, "stop");
+		assert.equal(final.content.filter((b) => b.type === "toolCall").length, 0);
+		const text = final.content.find((b) => b.type === "text");
+		assert.ok(text && text.type === "text");
+		assert.ok(text.text.includes('"name"'));
+	});
+
+	test("mid-stream transport failure surfaces as an error, not a clean stop", async () => {
+		const context = makeContext([{ role: "user", content: "Hi", timestamp: 1 }] as Message[]);
+		const encoder = new TextEncoder();
+		const fetchImpl = (async () => ({
+			ok: true,
+			status: 200,
+			text: async () => "",
+			body: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.enqueue(encoder.encode(`${textChunk("partial")}\n`));
+					controller.error(new Error("connection reset"));
+				},
+			}),
+		})) as unknown as typeof globalThis.fetch;
+		const { final } = await run(context, [], { fetch: fetchImpl });
+		assert.equal(final.stopReason, "error");
+		assert.ok(final.errorMessage?.includes("connection reset"));
+	});
+
+	test("aborted request reports aborted, not stop", async () => {
+		const context = makeContext([{ role: "user", content: "Hi", timestamp: 1 }] as Message[]);
+		const ac = new AbortController();
+		ac.abort();
+		const fetchImpl = (async () => {
+			const error = new Error("aborted");
+			error.name = "AbortError";
+			throw error;
+		}) as unknown as typeof globalThis.fetch;
+		const { final } = await run(context, [], { fetch: fetchImpl, signal: ac.signal });
+		assert.equal(final.stopReason, "aborted");
+	});
+
+	test("wrapfix call ids are unique across messages", async () => {
+		const context = makeContext([{ role: "user", content: "Read notes.txt", timestamp: 1 }] as Message[]);
+		const wrapped = [
+			textChunk('```json\n{"name": "read_file", "arguments": {"path": "notes.txt"}}\n```'),
+			doneChunk("stop"),
+		];
+		const first = await run(context, wrapped);
+		const second = await run(context, wrapped);
+		const id1 = first.final.content.find((b) => b.type === "toolCall");
+		const id2 = second.final.content.find((b) => b.type === "toolCall");
+		assert.ok(id1 && id1.type === "toolCall" && id2 && id2.type === "toolCall");
+		assert.notEqual(id1.id, id2.id);
 	});
 
 	test("plain text completion maps to stop, finish-length maps to length", async () => {
