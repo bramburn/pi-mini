@@ -1,0 +1,237 @@
+# Append-only goal_events.jsonl ledger (see .pi/goals/goal_events.jsonl).
+# Event vocabulary (reused verbatim, do not invent new names):
+#   goal_created, task_list_set (with blockCompletion), task_started,
+#   task_complete (with evidence), completion_requested, audit_result
+#   (verdict approved|disapproved + report), goal_archived — plus the new
+#   goal_amended (steering; carries a revision number).
+#
+# Legacy ledgers may additionally contain goal_paused, goal_resumed,
+# goal_completed and audit_started lines; the reducer ignores event types it
+# does not know, so old ledgers stay readable. The ledger is checkpointed by
+# .pi/goals/.goal-ledger-checkpoint.json and per-session running loops are
+# bound in .pi/loops/bindings-<session-uuid>.json {"loopIds":[...]}.
+address: goal-ledger
+description: >-
+  Event-sourced goal ledger at .pi/goals/goal_events.jsonl. One JSON object
+  per line; every line carries `type` (the event name below), `goalId`, and
+  usually `at` (ISO-8601). The current Goal state is a fold over these
+  events; the fold rules are specced in specs/features/goal-loop and
+  reference-implemented in tests/unit/lib/goal-loop.mjs (foldGoalEvents).
+messages:
+  goalCreated:
+    description: goal_created — a short goal was explicitly defined and the loop started.
+    payload:
+      $ref: ../../api/components/schemas/goal.yaml
+    examples:
+      - payload:
+          type: goal_created
+          goalId: muu69dvt-mtoxvg
+          objective: add /mini settings command
+          revision: 1
+          at: "2026-10-07T09:00:00.000Z"
+  goalAmended:
+    description: >-
+      goal_amended — steering: a user prompt mid-run amends the objective
+      and/or patches the task list. Carries the new revision number (previous
+      revision + 1). Subsequent loop turns must reflect the amended
+      objective. Demotes awaiting_audit back to active (stale-revision audit
+      results are ignored).
+    payload:
+      allOf:
+        - $ref: ../../api/components/schemas/goal.yaml#/$defs/schemas/GoalAmendment
+        - type: object
+          required:
+            - type
+            - goalId
+            - revision
+            - at
+          properties:
+            type:
+              type: string
+              enum:
+                - goal_amended
+            goalId:
+              type: string
+            revision:
+              type: integer
+              minimum: 2
+              description: The goal's new revision (always previous + 1).
+            at:
+              type: string
+              format: date-time
+    examples:
+      - payload:
+          type: goal_amended
+          goalId: muu69dvt-mtoxvg
+          revision: 2
+          reason: also expose the delegate budget in the settings output
+          taskListOps:
+            - op: add
+              task:
+                id: delegate-budget-status
+                title: Show delegate budget in /mini settings status
+                blockCompletion: true
+                verificationContract: /mini status output includes the delegate budget
+                status: pending
+          at: "2026-10-07T09:30:00.000Z"
+  taskListSet:
+    description: task_list_set — the task decomposition snapshot, with per-task blockCompletion flags.
+    payload:
+      allOf:
+        - type: object
+          required:
+            - type
+            - goalId
+            - taskCount
+            - tasks
+            - at
+          properties:
+            type:
+              type: string
+              enum:
+                - task_list_set
+            goalId:
+              type: string
+            taskCount:
+              type: integer
+            tasks:
+              $ref: ../../api/components/schemas/goal.yaml#/$defs/schemas/TaskListSet/properties/tasks
+            at:
+              type: string
+              format: date-time
+    examples:
+      - payload:
+          type: task_list_set
+          goalId: muu69dvt-mtoxvg
+          taskCount: 2
+          tasks:
+            - id: settings-command
+              title: Add /mini settings subcommand dispatch in index.ts
+              blockCompletion: true
+              verificationContract: settings.test.ts covers the dispatch; node --test green
+              status: pending
+            - id: docs
+              title: Update README with /mini settings usage
+              blockCompletion: false
+              verificationContract: README shows the new subcommand
+              status: pending
+          at: "2026-10-07T09:00:20.000Z"
+  taskStarted:
+    description: task_started — the loop picked up a task.
+    payload:
+      $ref: ../../api/components/schemas/goal.yaml#/$defs/schemas/TaskStarted
+    examples:
+      - payload:
+          type: task_started
+          goalId: muu69dvt-mtoxvg
+          taskId: settings-command
+          at: "2026-10-07T09:01:04.000Z"
+  taskComplete:
+    description: >-
+      task_complete — a task finished; `evidence` is mandatory (verifiable
+      proof quoted from the run, e.g. test counts). Without evidence the
+      reducer rejects the event.
+    payload:
+      $ref: ../../api/components/schemas/goal.yaml#/$defs/schemas/TaskComplete
+    examples:
+      - payload:
+          type: task_complete
+          goalId: muu69dvt-mtoxvg
+          taskId: settings-command
+          evidence: settings.test.ts 9/9 pass; /mini settings status shows the submenu
+          at: "2026-10-07T09:40:00.000Z"
+  completionRequested:
+    description: >-
+      completion_requested — every blockCompletion task carries evidence
+      (or the model emitted GOAL_STATUS: complete); the goal moves to
+      awaiting_audit and the audit gate runs.
+    payload:
+      type: object
+      required:
+        - type
+        - goalId
+        - revision
+        - at
+      properties:
+        type:
+          type: string
+          enum:
+            - completion_requested
+        goalId:
+          type: string
+        revision:
+          type: integer
+          description: Revision being completed; amendments after this point invalidate the audit.
+        at:
+          type: string
+          format: date-time
+    examples:
+      - payload:
+          type: completion_requested
+          goalId: muu69dvt-mtoxvg
+          revision: 2
+          at: "2026-10-07T10:00:00.000Z"
+  auditResult:
+    description: >-
+      audit_result — the completion gate verdict. approved -> complete ->
+      goal_archived, loop stops. disapproved -> back to active with the
+      report as continuation guidance; audit re-runs later.
+    payload:
+      $ref: ../../api/components/schemas/audit-result.yaml
+    examples:
+      - payload:
+          type: audit_result
+          goalId: muu69dvt-mtoxvg
+          revision: 2
+          verdict: disapproved
+          report: >-
+            Task settings-command evidence not reproducible: settings.test.ts
+            fails on main. Continue: fix the dispatch regression and
+            re-request completion.
+          continuation: Fix /mini settings dispatch regression, then re-run node --test.
+          auditor: mini
+          auditedAt: "2026-10-07T10:02:00.000Z"
+      - payload:
+          type: audit_result
+          goalId: muu69dvt-mtoxvg
+          revision: 2
+          verdict: approved
+          report: All blockCompletion tasks verified independently; settings.test.ts 9/9 green on main.
+          auditor: mini
+          auditedAt: "2026-10-07T10:20:00.000Z"
+  goalArchived:
+    description: >-
+      goal_archived — terminal event. The goal was written to
+      .pi/goals/archived/goal_*.md, unbound from the session, and the loop
+      stopped. status becomes archived.
+    payload:
+      type: object
+      required:
+        - type
+        - goalId
+        - archivePath
+        - at
+      properties:
+        type:
+          type: string
+          enum:
+            - goal_archived
+        goalId:
+          type: string
+        archivePath:
+          type: string
+          description: Path of the archived markdown snapshot, e.g. .pi/goals/archived/goal_20261007103000_muu69dvt-mtoxvg.md
+        stopReason:
+          type: string
+          examples:
+            - audit_approved
+        at:
+          type: string
+          format: date-time
+    examples:
+      - payload:
+          type: goal_archived
+          goalId: muu69dvt-mtoxvg
+          archivePath: .pi/goals/archived/goal_20261007103000_muu69dvt-mtoxvg.md
+          stopReason: audit_approved
+          at: "2026-10-07T10:21:00.000Z"

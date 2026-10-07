@@ -1,0 +1,174 @@
+description: >-
+  Mini-context schemas: token estimation, per-file budget reports, the mini
+  context-budget policy, and summary provenance records for .pi/mini/agents.md.
+type: object
+x-feature: mini-context
+$defs:
+  TokenEstimate:
+    description: >-
+      Offline token estimate for a text. No tokenizer is available offline, so
+      mini uses a character-based estimator: estimatedTokens = ceil(chars / 4 *
+      safetyFactor), rounded up. The estimator deliberately OVER-counts so the
+      ~1000-token instruction threshold errs on the side of prompting for a
+      summary. The 1000-token threshold is always evaluated against
+      estimatedTokens, never against a real tokenizer count.
+    type: object
+    required: [chars, estimatedTokens, method, safetyFactor]
+    properties:
+      chars:
+        type: integer
+        minimum: 0
+        description: Number of UTF-8 characters in the measured text.
+      estimatedTokens:
+        type: integer
+        minimum: 0
+        description: ceil(chars / 4 * safetyFactor) — the conservative estimate used for all threshold decisions.
+      method:
+        type: string
+        enum: ["chars/4"]
+        description: Estimation method identifier. "chars/4" is the only supported method.
+      safetyFactor:
+        type: number
+        minimum: 1
+        default: 1.2
+        description: >-
+          Multiplicative over-count safety factor applied on top of chars/4.
+          1.2 compensates for code/dense-markdown token density variance of
+          small local models' tokenizers.
+  FileBudgetReport:
+    description: >-
+      Budget verdict for a single candidate instruction file. Only global
+      (~/.pi/agent/AGENTS.md) and repo-root (cwd-level) files are eligible for
+      mini measurement; files pi itself loads from ABOVE the repo root via its
+      upward walk are pi's responsibility and are out of mini scope; subfolder
+      files are rejected and never enter mini context.
+    type: object
+    required: [path, scope, estimatedTokens, threshold, verdict]
+    properties:
+      path:
+        type: string
+        description: Absolute path of the candidate instruction file.
+      scope:
+        type: string
+        enum: [global, repo-root, rejected-subfolder]
+        description: >-
+          global = ~/.pi/agent/AGENTS.md (pi loads it first); repo-root = a
+          candidate (AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md,
+          CLAUDE.MD) at the repo root / cwd level; rejected-subfolder = found
+          below cwd — never loaded into mini context.
+      estimatedTokens:
+        $ref: "#/$defs/TokenEstimate"
+        description: Token estimate of the file content.
+      threshold:
+        type: integer
+        default: 1000
+        description: >-
+          Instruction token threshold from ContextBudgetPolicy.instructionTokenThreshold.
+          estimatedTokens <= threshold -> inline; > threshold -> user is prompted.
+      verdict:
+        type: string
+        enum: [inline, summarize-prompted, summarized, declined-truncated, omitted]
+        description: >-
+          inline = at or under threshold, injected as today; summarize-prompted =
+          over threshold, user prompted once per (path, mtime) and has not yet
+          answered; summarized = user accepted and a fresh summary exists at
+          summaryPath and is injected instead of the source; declined-truncated =
+          user declined summarization, file is NOT injected in full (mini keeps
+          the goal loop safe by omitting it rather than overflowing); omitted =
+          rejected-subfolder or otherwise excluded from mini context.
+      summaryPath:
+        type: string
+        description: >-
+          Path to the persisted summary (convention: .pi/mini/agents.md).
+          Present only when verdict is summarized.
+  ContextBudgetPolicy:
+    description: >-
+      Mini context-budget policy constants. The mini loop runs a much smaller
+      effective window than the model's physical maximum: ollama-native pins
+      num_ctx to the model's 131072-token window, but a tiny model's attention
+      quality and pi-mini's wrap-fix/delegation machinery degrade well before
+      that, and TINY_MAX_TOKENS (8192) output must fit inside the same window
+      alongside instructions and conversation. 32768 leaves ~80% compaction
+      headroom: instructions (<=1000 each after summarization) + several turns
+      of tool chatter + a full 8192-token generation fit without wrap-fix
+      residue risk.
+    type: object
+    required:
+      - instructionTokenThreshold
+      - effectiveContextWindow
+      - compactionThresholdPercent
+      - estimatorMethod
+      - estimatorSafetyFactor
+    properties:
+      instructionTokenThreshold:
+        type: integer
+        default: 1000
+        description: >-
+          Instruction files estimated over this many tokens trigger a one-time
+          (per path+mtime) user prompt to build a mini agents.md summary.
+      effectiveContextWindow:
+        type: integer
+        default: 32768
+        description: >-
+          Mini loop effective context window. MUST be <= the model's physical
+          contextWindow (131072) and MUST leave room for TINY_MAX_TOKENS (8192)
+          of generated output plus instruction budget plus conversation
+          headroom.
+      compactionThresholdPercent:
+        type: integer
+        default: 80
+        minimum: 1
+        maximum: 100
+        description: >-
+          Compaction line for the mini loop, evaluated against PROJECTED usage:
+          projectedPercent = (ctx.getContextUsage().tokens + TINY_MAX_TOKENS
+          output reserve) / effectiveContextWindow * 100, i.e. the reserve counts
+          as occupied before a turn starts. When projectedPercent reaches this
+          percentage, the loop compacts (delegating or summarizing outstanding
+          work via delegate_to_worker) rather than losing the goal. With the
+          defaults this fires at 18022 actual tokens, leaving the full 8192-token
+          generation guaranteed to fit inside 32768. Instruction budget counts
+          toward the window.
+      estimatorMethod:
+        type: string
+        enum: ["chars/4"]
+        description: Token estimator method applied to all instruction content.
+      estimatorSafetyFactor:
+        type: number
+        default: 1.2
+        description: Over-count multiplier; see TokenEstimate.safetyFactor.
+  SummaryRecord:
+    description: >-
+      Provenance metadata for a persisted mini agents.md summary. Written
+      alongside the summary so freshness can be checked after /reload without
+      re-prompting the user for unchanged sources. Hash and mtime are BOTH
+      recorded because mtime alone can be preserved by naive file copies.
+    type: object
+    required: [sourcePath, sourceMtimeMs, sourceHash, summaryPath, createdAt, createdBy]
+    properties:
+      sourcePath:
+        type: string
+        description: Absolute path of the instruction file the summary was made from.
+      sourceMtimeMs:
+        type: integer
+        description: Source file mtime in milliseconds at summarization time.
+      sourceHash:
+        type: string
+        description: >-
+          Content hash of the source at summarization time (sha256 over the raw
+          bytes, hex). Compared on every evaluation; a mismatch marks the
+          summary stale and re-prompts the user.
+      summaryPath:
+        type: string
+        description: Path of the generated summary (convention .pi/mini/agents.md).
+      createdAt:
+        type: string
+        format: date-time
+        description: When the summary was generated (ISO 8601).
+      createdBy:
+        type: string
+        enum: [mini, worker]
+        description: >-
+          mini = generated by the tiny model with the bounded extraction prompt;
+          worker = generated via the delegate_to_worker escape hatch because the
+          source was too large for the tiny model's reliable extraction.

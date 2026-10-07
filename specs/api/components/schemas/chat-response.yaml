@@ -1,0 +1,2 @@
+description: "TODO(ollama) — /api/chat NDJSON stream chunk: message (with tool_calls), done flag, done_reason."
+type: object

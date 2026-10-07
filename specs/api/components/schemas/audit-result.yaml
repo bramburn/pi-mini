@@ -1,0 +1,79 @@
+description: >-
+  Payload of the audit_result ledger event: the completion gate verdict. The
+  auditor re-verifies the claimed evidence for every blockCompletion task
+  before the goal may be archived. A disapproved verdict must carry
+  continuation guidance (what is missing and what to do next) so the loop can
+  resume instead of stalling.
+type: object
+required:
+  - goalId
+  - revision
+  - verdict
+  - report
+  - auditor
+  - auditedAt
+properties:
+  goalId:
+    description: Goal under audit (matches the Goal.id / ledger goalId).
+    type: string
+    examples:
+      - muu69dvt-mtoxvg
+  revision:
+    description: >-
+      Goal revision the audit was run against. If the goal was amended after
+      completion_requested, the audit result for a stale revision is ignored
+      and the audit re-runs against the current revision.
+    type: integer
+    minimum: 1
+    examples:
+      - 3
+  verdict:
+    description: >-
+      approved: evidence verified, the goal transitions complete and is
+      archived, the loop stops. disapproved: evidence insufficient or
+      contradicted; the goal returns to active and the loop continues with
+      `report` as guidance; the audit re-runs after further work.
+    type: string
+    enum:
+      - approved
+      - disapproved
+    examples:
+      - approved
+  report:
+    description: >-
+      The audit report. On disapproved this must include continuation
+      guidance: which tasks/evidence failed verification and what to do next.
+    type: string
+    minLength: 1
+    examples:
+      - >-
+        Task settings-command evidence not reproducible: settings.test.ts
+        fails on main. Continue: fix the dispatch regression and re-request
+        completion.
+  continuation:
+    description: >-
+      Machine-usable continuation guidance, present exactly when verdict is
+      disapproved. Injected into the loop prompt by the prompt builder so the
+      next turns act on it.
+    type: string
+    examples:
+      - Fix /mini settings dispatch regression, then re-run node --test.
+  auditor:
+    description: >-
+      Which auditor produced the verdict. "mini" = the tiny model self-audits
+      its own evidence (default, config goalAudit: "self"). "worker" =
+      evidence is delegated to the configured large model via
+      delegate_to_worker (config goalAudit: "worker"), recommended for goals
+      the tiny model cannot verify alone.
+    type: string
+    enum:
+      - mini
+      - worker
+    examples:
+      - mini
+  auditedAt:
+    description: ISO-8601 timestamp of the audit_result event.
+    type: string
+    format: date-time
+    examples:
+      - "2026-10-07T10:00:00.000Z"

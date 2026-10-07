@@ -1,0 +1,182 @@
+description: >-
+  Mini-context budget surface. Three concerns: (1) evaluate candidate
+  instruction files against the token budget and current context usage;
+  (2) record the user's summarize/decline decision and generate + persist the
+  summary at .pi/mini/agents.md; (3) resolve what mini actually sees in its
+  injected system prompt. Paths are pi-mini internal surfaces (x-pi-mini:
+  true), not Ollama endpoints.
+x-feature: mini-context
+post:
+  operationId: evaluateContextBudget
+  summary: Evaluate candidate instruction files against the mini context budget
+  tags: [mini-context]
+  description: >-
+    Called on mini enable, on session start, and on /reload. Measures each
+    eligible candidate — the global ~/.pi/agent/AGENTS.md and repo-root
+    candidates (AGENTS.override.md, AGENTS.md, AGENTS.MD, CLAUDE.md, CLAUDE.MD)
+    — with the offline estimator (ceil(chars/4 * safetyFactor), safetyFactor
+    1.2). Files at or under the 1000-token threshold are verdict "inline".
+    Files over threshold are verdict "summarize-prompted": the user is prompted
+    exactly once per (path, mtime); the prompt is re-raised only when the
+    source mtime/hash changes (stale summaries are never silently reused).
+    Subfolder AGENTS.md files are reported as scope "rejected-subfolder",
+    verdict "omitted" — they never enter mini context. Files pi loads from
+    above the repo root via its upward walk are pi's responsibility and are NOT
+    measured here. The request carries the live ctx.getContextUsage() reading
+    so the verdict report can also flag when compactionThresholdPercent (80)
+    of effectiveContextWindow (32768) is reached.
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          required: [candidates, contextUsage]
+          properties:
+            candidates:
+              type: array
+              description: Absolute paths of instruction files discovered by the caller (global + repo-root only).
+              items:
+                type: string
+            cwd:
+              type: string
+              description: Session working directory used for repo-root / subfolder classification.
+            contextUsage:
+              type: object
+              description: Live reading from pi's extension API (ctx.getContextUsage()).
+              required: [tokens, contextWindow, percent]
+              properties:
+                tokens:
+                  type: integer
+                contextWindow:
+                  type: integer
+                percent:
+                  type: number
+  responses:
+    "200":
+      description: Budget report with a verdict per candidate file and the overall window status.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [reports, policy, compaction]
+            properties:
+              reports:
+                type: array
+                items:
+                  $ref: ../../components/schemas/context-budget.yaml#/$defs/FileBudgetReport
+              policy:
+                $ref: ../../components/schemas/context-budget.yaml#/$defs/ContextBudgetPolicy
+              compaction:
+                type: object
+                required: [usagePercent, thresholdPercent, shouldCompact]
+                properties:
+                  usagePercent:
+                    type: number
+                    description: >-
+                      PROJECTED usage percent: (ctx.getContextUsage().tokens +
+                      TINY_MAX_TOKENS output reserve) / effectiveContextWindow *
+                      100. The reserve counts as occupied before a turn starts,
+                      so a full-size generation always fits when the threshold
+                      fires.
+                  thresholdPercent:
+                    type: integer
+                    description: policy.compactionThresholdPercent (80).
+                  shouldCompact:
+                    type: boolean
+                    description: >-
+                      true when usagePercent >= thresholdPercent: the loop must
+                      compact (delegate/summarize outstanding work) rather than
+                      lose the goal. Instruction budget counts toward the window.
+put:
+  operationId: storeSummaryDecision
+  summary: Record the user decision and generate + persist the mini agents.md summary
+  tags: [mini-context]
+  description: >-
+    Called after the user answers the over-budget prompt. If choice is
+    "summarize", the summary is generated with the bounded extraction prompt by
+    the tiny model (fallback createdBy "worker" via delegate_to_worker for very
+    large sources), validated against the quality bar (estimated <= 1000
+    tokens; keyword/canary retention checks for commands, conventions, and
+    forbidden actions), and written to .pi/mini/agents.md together with its
+    SummaryRecord provenance (source path, mtime, sha256, createdAt,
+    createdBy). If choice is "decline", the source file is NOT injected in full
+    (verdict "declined-truncated"): mini keeps the loop safe by omitting it.
+    The prompt is keyed on (path, sourceMtimeMs, sourceHash); re-sending the
+    same key is idempotent.
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          required: [path, choice]
+          properties:
+            path:
+              type: string
+              description: Absolute path of the over-budget instruction file.
+            choice:
+              type: string
+              enum: [summarize, decline]
+              description: User answer to the one-time (per path+mtime+hash) prompt.
+            sourceMtimeMs:
+              type: integer
+            sourceHash:
+              type: string
+  responses:
+    "200":
+      description: The stored summary record (or decline marker) and resulting file verdict.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [verdict, record]
+            properties:
+              verdict:
+                type: string
+                enum: [summarized, declined-truncated]
+              record:
+                $ref: ../../components/schemas/context-budget.yaml#/$defs/SummaryRecord
+get:
+  operationId: resolveEffectiveInstructions
+  summary: Resolve the instruction block mini actually injects into MINI_SYSTEM_PROMPT
+  tags: [mini-context]
+  description: >-
+    Computes the exact <project_instructions> content the mini system prompt
+    carries for this session: inline files at or under threshold, fresh
+    summaries at summaryPath in place of their over-threshold sources, nothing
+    for declined or omitted files, and never any subfolder content. Asserts
+    size accounting — instruction block plus configured conversation headroom
+    plus TINY_MAX_TOKENS (8192) must fit within effectiveContextWindow
+    (32768) — before the block is injected via pi.on("before_agent_start").
+  parameters:
+    - name: cwd
+      in: query
+      required: true
+      schema:
+        type: string
+  responses:
+    "200":
+      description: The effective instruction block plus its size accounting.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [instructionBlock, estimatedTokens, fitsEffectiveWindow]
+            properties:
+              instructionBlock:
+                type: string
+                description: >-
+                  Exact text injected into MINI_SYSTEM_PROMPT (rendered as
+                  <project_instructions path="..."> blocks, mirroring pi's
+                  system-prompt rendering).
+              estimatedTokens:
+                $ref: ../../components/schemas/context-budget.yaml#/$defs/TokenEstimate
+              fitsEffectiveWindow:
+                type: boolean
+                description: true when instruction block + conversation headroom + TINY_MAX_TOKENS <= effectiveContextWindow.
+              provenance:
+                type: array
+                items:
+                  $ref: ../../components/schemas/context-budget.yaml#/$defs/SummaryRecord
+                description: Summary records backing any summarized entries.

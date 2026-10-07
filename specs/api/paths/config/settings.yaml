@@ -1,0 +1,118 @@
+description: >-
+  /mini/config/settings — the PiMiniConfig file (~/.pi/agent/pi-mini.json) as a
+  REST-shaped resource, as manipulated by the /mini settings page. GET loads
+  with field-by-field validation fallback plus legacy-model migration (same
+  semantics as settings.ts loadConfig); PUT replaces the whole config and must
+  satisfy the PiMiniConfig vNext schema; PATCH applies a partial update (e.g.
+  toggle `enabled`, set the `tiny` model ref) with per-field validation
+  fallback identical to GET.
+get:
+  operationId: getPiMiniSettings
+  summary: Load the pi-mini config with validation fallback and legacy migration
+  description: >-
+    Loads ~/.pi/agent/pi-mini.json and returns the effective PiMiniConfig vNext.
+    Field-by-field validation fallback applies: each invalid or missing field
+    is replaced by its documented default (see the PiMiniConfig schema), the
+    legacy Qwen2.5-Coder tiny ref is migrated to ollama-mini/granite4.2:8b,
+    and a missing or malformed file yields all defaults. `enabled` defaults to
+    false when absent (configs written before the settings page existed).
+  tags:
+    - config
+  responses:
+    "200":
+      description: Effective config after validation fallback and migration.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/pi-mini-config.yaml
+put:
+  operationId: putPiMiniSettings
+  summary: Replace the whole pi-mini config (schema-validated save)
+  description: >-
+    Replaces the entire config with the request body and persists it via
+    settings.ts saveConfig (best-effort, mkdir -p + pretty JSON). The body
+    must satisfy the PiMiniConfig vNext schema — invalid enum values, a
+    delegateBudget below 1, or a malformed ModelRef are rejected with 422
+    rather than silently falling back (PUT is the strict write path; lenient
+    fallback is reserved for GET/PATCH loads of files the user may have
+    hand-edited).
+  tags:
+    - config
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          $ref: ../../components/schemas/pi-mini-config.yaml
+  responses:
+    "200":
+      description: The persisted config (echo of the validated body).
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/pi-mini-config.yaml
+    "422":
+      description: Body violates the PiMiniConfig schema; nothing was written.
+patch:
+  operationId: patchPiMiniSettings
+  summary: Partially update the pi-mini config (e.g. toggle enabled, set tiny model)
+  description: >-
+    Applies only the provided fields and persists the result. Validation
+    semantics match GET: each provided field that fails its per-field check is
+    skipped (left at its current effective value) instead of failing the whole
+    PATCH, mirroring loadConfig's field-by-field fallback. Typical settings-page
+    calls: `{"enabled": true}` on Enable, `{"enabled": false}` on Disable,
+    `{"tiny": {"provider": "...", "modelId": "..."}}` after a picker
+    selection. Changing `tiny` while mini mode is active takes effect on the
+    next enable (or immediately via the live model switch, per the picker
+    spec).
+  tags:
+    - config
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          description: Partial PiMiniConfig; only the keys present are updated.
+          properties:
+            tiny:
+              description: New tiny ModelRef (validated as a ModelRef; invalid values are skipped).
+              type: object
+              properties:
+                provider:
+                  type: string
+                modelId:
+                  type: string
+            large:
+              description: New large ModelRef, or null/omitted to leave unchanged.
+              type: object
+              properties:
+                provider:
+                  type: string
+                modelId:
+                  type: string
+            think:
+              description: New think flag (non-boolean values are skipped).
+              type: boolean
+            toolsMode:
+              description: New tools mode (values outside the enum are skipped).
+              type: string
+              enum:
+                - curated
+                - all
+                - read-only
+            delegateBudget:
+              description: New delegate budget (integers >= 1; others are skipped).
+              type: integer
+              minimum: 1
+            enabled:
+              description: New persistent enabled flag written by the settings page (non-boolean values are skipped).
+              type: boolean
+  responses:
+    "200":
+      description: The effective config after applying the patch.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/pi-mini-config.yaml

@@ -9,6 +9,12 @@
 		"test": "node --test"
 	},
 	"pi": {
-		"extensions": ["./index.ts"]
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"devDependencies": {
+		"@stoplight/spectral-cli": "^6.17.0",
+		"yaml": "^2.9.1"
 	}
 }

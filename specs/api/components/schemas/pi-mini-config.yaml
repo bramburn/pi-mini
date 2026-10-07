@@ -1,0 +1,93 @@
+description: >-
+  PiMiniConfig vNext — the persisted shape of ~/.pi/agent/pi-mini.json as owned
+  by settings.ts (loadConfig/saveConfig). Every field is validated
+  independently on load: an invalid or missing field falls back to its default
+  and never invalidates the rest of the file (field-by-field validation
+  fallback). Malformed JSON as a whole keeps all defaults. A config still
+  pointing at the retired legacy tiny model
+  (ollama/hf.co/mradermacher/Qwen2.5-Coder-7B-Instruct-abliterated-GGUF:Q4_K_M)
+  is migrated to the native granite default on load.
+type: object
+additionalProperties: false
+required:
+  - tiny
+  - think
+  - toolsMode
+  - delegateBudget
+  - enabled
+properties:
+  tiny:
+    description: >-
+      ModelRef {provider, modelId} assigned to the tiny (orchestrator) slot.
+      Default: {provider: "ollama-mini", modelId: "granite4.2:8b"}. Validation
+      fallback: if `tiny` is missing or is not an object with two string
+      fields, the default ref is used. The legacy Qwen2.5-Coder pairing above
+      is migrated to the default on load.
+    type: object
+    additionalProperties: false
+    required:
+      - provider
+      - modelId
+    properties:
+      provider:
+        description: Provider id that serves the model. Default "ollama-mini" (pi-mini's own native Ollama provider, kept distinct from the user's "ollama" catalogue provider).
+        type: string
+      modelId:
+        description: Model id within the provider. Default "granite4.2:8b".
+        type: string
+  large:
+    description: >-
+      ModelRef for the delegate_to_worker large model. Default: undefined
+      (unset; /mini on captures the current session model as the default).
+      Validation fallback: if present but not a valid ModelRef (object with
+      two string fields), the field is dropped back to undefined.
+    type: object
+    additionalProperties: false
+    required:
+      - provider
+      - modelId
+    properties:
+      provider:
+        description: Provider id of the large worker model.
+        type: string
+      modelId:
+        description: Model id of the large worker model.
+        type: string
+  think:
+    description: >-
+      Granite-style thinking toggle for the tiny model. Default false (thinking
+      cripples interactive tool loops on local models, ~10x latency).
+      Validation fallback: a non-boolean value falls back to false.
+    type: boolean
+    default: false
+  toolsMode:
+    description: >-
+      Which tools the tiny model gets in mini mode (delegate_to_worker is
+      always added on top). Default "curated". Validation fallback: any value
+      outside the enum falls back to "curated".
+    type: string
+    enum:
+      - curated
+      - all
+      - read-only
+    default: curated
+  delegateBudget:
+    description: >-
+      Max delegate_to_worker calls per user turn. Default 8
+      (DEFAULT_DELEGATE_BUDGET). Validation fallback: a non-number or a number
+      < 1 falls back to 8; a fractional valid number is floored.
+    type: integer
+    minimum: 1
+    default: 8
+  enabled:
+    description: >-
+      NEW in vNext. Whether pi-mini is enabled as a persistent preference,
+      written by the /mini settings page Enable/Disable action. Default false.
+      Validation fallback: a non-boolean value falls back to false. Semantics:
+      enabling via the settings page persists enabled=true AND activates mini
+      mode for the current session (identical state to /mini on); new sessions
+      start in mini mode when enabled=true. Disabling persists enabled=false
+      and deactivates, restoring the previous model and tools. The session-only
+      /mini on|off commands do NOT read or write this flag.
+    type: boolean
+    default: false

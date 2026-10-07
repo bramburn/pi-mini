@@ -1,0 +1,48 @@
+# Spectral config for the pi-mini spec tree.
+#
+# Extends the stock OpenAPI and AsyncAPI rulesets. Both rulesets ship rules
+# tagged with document formats (oas3 / asyncapi3), so each set only fires on
+# the matching root document even though both are extended here.
+#
+#   npx spectral lint specs/api/openapi.yaml specs/async/asyncapi.yaml
+extends:
+  - spectral:oas
+  - spectral:asyncapi
+
+rules:
+  # spectral 6.17 flags valid OpenAPI 3.1 path-item $refs as
+  # "unevaluated properties" (upstream false positive). Downgrade to warn;
+  # $ref resolution and structural validity are enforced by
+  # tests/contract/spec-integrity.test.mjs.
+  oas3-schema: warn
+
+  # Every operation must carry an operationId (OpenAPI and AsyncAPI 3 alike).
+  pi-mini-operation-id:
+    description: Every operation must declare a unique operationId.
+    severity: error
+    given:
+      - $.paths[*][get,put,post,delete,options,head,patch,trace]
+      - $.operations[*]
+    then:
+      field: operationId
+      function: truthy
+
+  # Every schema (components.schemas entries, incl. placeholder files) needs
+  # a description so placeholders stay self-explanatory.
+  pi-mini-schema-description:
+    description: Every schema must have a description.
+    severity: error
+    given:
+      - $.components.schemas[*]
+    then:
+      field: description
+      function: truthy
+
+  # Every spec root document must tag which feature it belongs to.
+  pi-mini-feature-tag:
+    description: Spec root documents must declare an x-feature tag.
+    severity: error
+    given: $
+    then:
+      field: x-feature
+      function: truthy

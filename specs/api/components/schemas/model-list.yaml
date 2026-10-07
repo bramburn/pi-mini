@@ -1,0 +1,145 @@
+description: >-
+  GET /api/tags 200 response (Ollama native API), consumed by the settings-page
+  model picker as its local-model data source, plus the merged picker list.
+  The picker merges this payload with pi's modelRegistry and filters to local
+  runtimes only.
+type: object
+additionalProperties: false
+required:
+  - models
+properties:
+  models:
+    description: Models available on the local Ollama server.
+    type: array
+    items:
+      $ref: "#/$defs/OllamaTagModel"
+$defs:
+  OllamaTagModel:
+    description: >-
+      One entry of /api/tags `models[]`. `name` and `model` usually carry the
+      same "repo:tag" id; `details` carries Ollama's parsed model card info.
+    type: object
+    additionalProperties: false
+    required:
+      - name
+      - model
+      - size
+      - digest
+      - details
+    properties:
+      name:
+        description: Model id as addressed on /api/chat (e.g. "granite4.2:8b").
+        type: string
+      model:
+        description: Canonical "repo:tag" name of the pulled model.
+        type: string
+      size:
+        description: Size of the model on disk in bytes.
+        type: integer
+        format: int64
+      digest:
+        description: Content digest of the model.
+        type: string
+      modified_at:
+        description: Pull/modification timestamp (RFC 3339), when present.
+        type: string
+      details:
+        description: Ollama-parsed model card details.
+        type: object
+        additionalProperties: false
+        properties:
+          family:
+            description: Primary model family (e.g. "granite").
+            type: string
+          families:
+            description: All families contributing to the model.
+            type: array
+            items:
+              type: string
+          parameter_size:
+            description: Human-readable parameter size (e.g. "8B").
+            type: string
+          quantization_level:
+            description: Quantization of the weights (e.g. "Q4_K_M").
+            type: string
+          context_length:
+            description: Native context length in tokens, when reported.
+            type: integer
+      capabilities:
+        description: >-
+          Advertised capabilities. Picker-relevant values: "completion"
+          (chat-capable) and "tools" (native tool calling). Entries without
+          "completion" (e.g. "embedding"-only models) are not chat candidates
+          but remain listable.
+        type: array
+        items:
+          type: string
+          enum:
+            - completion
+            - tools
+            - vision
+            - embedding
+  LocalRuntimeTag:
+    description: >-
+      Provider tags that identify a model as served by a LOCAL runtime
+      (llama.cpp / Ollama-class). Anything else — minimax/openai/anthropic-
+      class cloud providers — is remote and excluded from the settings-page
+      picker. "ollama" is the user's own Ollama catalogue provider;
+      "ollama-mini" is pi-mini's native provider (the tiny slot's default);
+      "llama-cpp" is the named alternative local runtime.
+    type: string
+    enum:
+      - ollama
+      - ollama-mini
+      - llama-cpp
+  ModelSource:
+    description: >-
+      Discriminator on every merged picker entry naming where the entry came
+      from. "ollama-tags" = present in the live GET /api/tags payload (the
+      Ollama server actually serves it); "registry" = only present in pi's
+      modelRegistry (e.g. the ollama-mini catalogue entry, or a configured
+      local provider whose model is not currently pulled — shown so the user
+      can pick it, flagged as not-yet-pulled).
+    type: string
+    enum:
+      - ollama-tags
+      - registry
+  PickerModelEntry:
+    description: >-
+      One row of the settings-page picker list after the merge and the
+      local-runtime filter.
+    type: object
+    additionalProperties: false
+    required:
+      - provider
+      - modelId
+      - source
+    properties:
+      provider:
+        description: Provider id; must carry a LocalRuntimeTag value to appear in the picker.
+        type: string
+      modelId:
+        description: Model id within the provider (e.g. "granite4.2:8b").
+        type: string
+      name:
+        description: Display name when the registry provides one; defaults to modelId.
+        type: string
+      source:
+        $ref: "#/$defs/ModelSource"
+      current:
+        description: True when this entry equals the config's tiny ModelRef (receives the ✓ marker and is sorted first).
+        type: boolean
+      pulled:
+        description: True when the entry is served right now (source "ollama-tags"); registry-only entries are false.
+        type: boolean
+x-local-filter-rule: >-
+  Filtering decision table (settings-page picker is local-models-only):
+  (1) an entry sourced from GET /api/tags is LOCAL — the Ollama server serves
+  it; (2) an entry with provider "ollama-mini" is LOCAL (pi-mini's native
+  provider); (3) an entry with provider "ollama" is LOCAL (user's local Ollama
+  catalogue); (4) an entry with provider "llama-cpp" is LOCAL; (5) entries with
+  minimax/openai/anthropic-class (remote) providers are EXCLUDED. Merge rule:
+  /api/tags entries (as provider "ollama", source "ollama-tags") are merged
+  with registry entries whose provider is a LocalRuntimeTag (source
+  "registry"), deduped by (provider, modelId) with the ollama-tags copy
+  winning, then sorted current-model-first and provider-alphabetical after.

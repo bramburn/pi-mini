@@ -1,0 +1,106 @@
+# NDJSON chat stream from POST /api/chat (see ollama-native.ts).
+# One JSON object per line; events below are the pi-mini-recognized kinds,
+# in the order the stream layer emits them.
+address: ollama-ndjson
+description: >-
+  Ollama native /api/chat NDJSON stream as consumed by ollama-native.ts. Raw
+  chunks carry `message` (assistant deltas), `tool_calls`, `done`,
+  `done_reason`, and usage counters; ollama-native.ts re-emits them as the
+  pi-mini-recognized event vocabulary below. think:false is always sent;
+  num_ctx is pinned to the model context window and num_predict caps output
+  (see paths/ollama/chat.yaml). Before the `done` event the wrap-fix repair
+  pass may convert a text-wrapped tool call into a wrapfixCall, and a 90s
+  silent stream aborts as a tool error instead of hanging.
+messages:
+  message:
+    description: >-
+      A streamed assistant text/thinking delta, or the terminal message on
+      `done`. Carries content deltas, thinking deltas (only when think:true —
+      off by default because thinking cripples tool loops), usage
+      (prompt_eval_count/eval_count/prompt_eval_cached_count) on the done
+      chunk, and done_reason ("stop" even when tool calls are present — call
+      presence is the toolUse signal).
+    payload:
+      $ref: ../../api/components/schemas/chat-response.yaml
+  toolCall:
+    description: >-
+      A NATIVE tool_call block emitted by the model inside a chunk's
+      `message.tool_calls[]` (granite's native tool calling). id defaults to
+      `ollama_call_<n>` when absent; `function.arguments` arrives in object
+      form (coerced via repairArgs when a build sends a string). Call presence
+      marks the stream stopReason "toolUse". Not to be confused with
+      wrapfixCall, which is synthesized by the repair layer.
+    payload:
+      type: object
+      description: Native Ollama tool_call entry as parsed from message.tool_calls[].
+      properties:
+        id:
+          description: Call id; ollama-native.ts assigns `ollama_call_<index>` when the server omits one.
+          type: string
+        type:
+          description: Always "function".
+          type: string
+          const: function
+        function:
+          type: object
+          properties:
+            name:
+              description: Name of the called tool.
+              type: string
+            arguments:
+              description: Tool arguments — object form preferred; a string form is repaired via repairArgs.
+              type: object
+  wrapfixCall:
+    description: >-
+      A text-wrapped (degraded) tool call recovered by the wrap-fix repair pass
+      and converted back into a real toolCall BEFORE the done event so pi's
+      agent loop executes it natively. id carries the `wrapfix_call_<n>`
+      prefix with a monotonic sequence (never collides across replayed
+      history). Emitted only when the model dropped out of native tool-call
+      mode and wrote the call as (possibly truncated) JSON text; conversion is
+      skipped when the residual prose around the call exceeds 200 characters
+      (documentation/example text stays prose). Per-turn executions of
+      wrapfix_call_* ids are capped at 2 — a third repeat is blocked with a
+      self-correcting tool error instead of looping. On a stalled generation
+      the detected call is emitted with EMPTY arguments so tool validation
+      fails and the model retries in smaller steps (or delegates).
+    payload:
+      type: object
+      properties:
+        id:
+          description: Monotonic id with the wrapfix_call_ prefix, e.g. wrapfix_call_3.
+          type: string
+          pattern: ^wrapfix_call_[0-9]+$
+        type:
+          description: Always "function".
+          type: string
+          const: function
+        function:
+          type: object
+          properties:
+            name:
+              description: Name of the detected wrapped tool.
+              type: string
+            arguments:
+              description: Repaired arguments, or {} when the generation stalled mid-call.
+              type: object
+  stallWatchdogAbort:
+    description: >-
+      Emitted when the stall watchdog fires — no stream bytes for 90 seconds
+      (DEFAULT_STALL_TIMEOUT_MS) — and the repair pass cannot recover a tool
+      call from the partial text. The controller aborts the fetch; the stream
+      reports an error (never a clean-looking truncated message), and if a
+      wrapped call WAS detected it is emitted as a wrapfixCall with empty
+      arguments plus a "[pi-mini] generation stalled mid tool call" notice so
+      the tool errors out and the loop self-corrects instead of hanging.
+    payload:
+      type: object
+      properties:
+        stallTimeoutMs:
+          description: Silence threshold that triggered the abort. Default 90000.
+          type: integer
+        recoveredCall:
+          description: Name of the wrapped tool call recovered with empty arguments, or null when nothing was recoverable.
+          type:
+            - string
+            - "null"

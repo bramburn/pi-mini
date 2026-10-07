@@ -1,0 +1,230 @@
+# REST-shaped operations over the goal state resource. The resource is
+# file-backed, not HTTP-served: .pi/goals/goal_events.jsonl is the
+# append-only event log, .pi/goals/.goal-ledger-checkpoint.json the folded
+# accumulator, .pi/goals/archived/goal_*.md the archival format, and
+# .pi/loops/bindings-<session-uuid>.json {"loopIds":[...]} binds running
+# loops to pi sessions.
+#
+# The scaffold root registers one path for this feature, so the two POST
+# semantics (create + start, request completion / audit) share the POST slot
+# and are discriminated by the request body's `action` field. The logical
+# operationIds are `createGoal` (declared on the operation below) and
+# `requestGoalCompletion` (the action=requestCompletion variant, documented
+# under x-actionVariants); an RPC adapter exposes both verbatim.
+description: >-
+  Goal state resource for the goal-driven continuous loop (`/mini goal
+  <objective>`). GET folds the ledger into the current Goal; POST creates a
+  goal and starts the loop, or requests completion and runs the audit gate;
+  PATCH applies a steering amendment (goal_amended, revision bump).
+get:
+  operationId: getGoalState
+  summary: Read the current goal state for the session's active loop
+  description: >-
+    Folds .pi/goals/goal_events.jsonl (from the last
+    .goal-ledger-checkpoint.json) into the current Goal and returns it. 404
+    when the session has no active goal (no entry in
+    .pi/loops/bindings-<session>.json, or no goal_created for any bound
+    loopId).
+  tags:
+    - goal-loop
+  parameters:
+    - name: session
+      in: query
+      required: true
+      description: pi session UUID; resolves bindings via .pi/loops/bindings-<session>.json.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    "200":
+      description: Current folded goal state.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/goal.yaml
+          example:
+            id: muu69dvt-mtoxvg
+            objective: add /mini settings command
+            revision: 2
+            status: active
+            taskList:
+              - id: settings-command
+                title: Add /mini settings subcommand dispatch
+                blockCompletion: true
+                verificationContract: settings.test.ts covers dispatch; node --test green
+                status: in_progress
+              - id: docs
+                title: Update README with /mini settings usage
+                blockCompletion: false
+                verificationContract: README shows the new subcommand
+                status: pending
+            usage:
+              tokensUsed: 42000
+              activeSeconds: 640
+            createdAt: "2026-10-07T09:00:00.000Z"
+            amendedAt: "2026-10-07T09:30:00.000Z"
+    "404":
+      description: No active goal for the session.
+
+post:
+  operationId: createGoal
+  summary: >-
+    POST /goal-state — create a goal and start the loop (action=create), or
+    request completion and run the audit gate (action=requestCompletion,
+    logical operationId requestGoalCompletion)
+  description: >-
+    action=create: appends goal_created and the initial task_list_set (from
+    the model's decomposition, or from taskList in the body) to
+    .pi/goals/goal_events.jsonl, binds the new loopId to the session in
+    .pi/loops/bindings-<session>.json, and starts the autonomous loop: on
+    every agent_settled the loop re-injects the goal prompt block through the
+    before_agent_start seam and continues without new user input until the
+    completion gate fires. The objective must be explicitly defined — an
+    empty objective is rejected (400). The completion signal the model must
+    emit when it believes every blockCompletion task is done is the line
+    `GOAL_STATUS: complete` (or `GOAL_STATUS: blocked` with a reason).
+
+    action=requestCompletion (operationId requestGoalCompletion): emitted by
+    the loop when every blockCompletion task carries evidence, or when the
+    model emits GOAL_STATUS: complete. Appends completion_requested,
+    transitions the goal to awaiting_audit, and runs the audit per config
+    (goalAudit "self": mini self-audit; "worker": delegate_to_worker to the
+    large model). approved -> complete -> goal_archived (archived goal_*.md),
+    the loop unbinds and stops. disapproved -> back to active with the audit
+    report as continuation guidance; the audit re-runs after further work.
+  tags:
+    - goal-loop
+  parameters:
+    - name: session
+      in: query
+      required: true
+      schema:
+        type: string
+        format: uuid
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          oneOf:
+            - $ref: "#/components/schemas/GoalCreateAction"
+            - $ref: "#/components/schemas/GoalCompletionAction"
+          discriminator:
+            propertyName: action
+            mapping:
+              create: "#/components/schemas/GoalCreateAction"
+              requestCompletion: "#/components/schemas/GoalCompletionAction"
+  responses:
+    "201":
+      description: Goal created; loop started.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/goal.yaml
+    "202":
+      description: >-
+        action=requestCompletion accepted; audit scheduled and the goal moved
+        to awaiting_audit.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/audit-result.yaml
+    "400":
+      description: Empty objective, or unknown action.
+    "404":
+      description: action=requestCompletion but no active goal for the session.
+    "409":
+      description: >-
+        action=create with a goal already active (amend or finish it first),
+        or action=requestCompletion while some blockCompletion task lacks
+        evidence.
+
+x-actionVariants:
+  requestGoalCompletion:
+    operationId: requestGoalCompletion
+    method: post
+    discriminatorAction: requestCompletion
+    summary: Request completion of the active goal and run the audit gate.
+
+patch:
+  operationId: amendGoal
+  summary: Steering amendment — a user prompt mid-run amends objective/task list
+  description: >-
+    Applies a GoalAmendment while the loop runs: appends a goal_amended event
+    (carrying the next revision number, the amendment reason, and an optional
+    objective replacement and/or taskListOps), increments the goal revision,
+    and rebinds the running loop so its next turns reflect the amended
+    objective. Emitted whenever interactive/rpc user input arrives while a
+    goal is active. If the goal is awaiting_audit, an amendment demotes it
+    back to active and any audit_result for the now-stale revision is ignored
+    (the audit re-runs against the new revision after further work).
+  tags:
+    - goal-loop
+  parameters:
+    - name: session
+      in: query
+      required: true
+      schema:
+        type: string
+        format: uuid
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          type: object
+          required:
+            - amendment
+          properties:
+            amendment:
+              $ref: ../../components/schemas/goal.yaml#/$defs/schemas/GoalAmendment
+  responses:
+    "200":
+      description: Amendment applied; revision incremented.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/goal.yaml
+    "404":
+      description: No active goal to amend.
+
+components:
+  schemas:
+    GoalCreateAction:
+      description: POST body variant action=create — define a goal and start the loop.
+      type: object
+      required:
+        - action
+        - objective
+      properties:
+        action:
+          type: string
+          enum:
+            - create
+        objective:
+          type: string
+          minLength: 1
+          description: The short, explicitly defined goal.
+        taskList:
+          description: >-
+            Optional initial decomposition; otherwise the first loop turn
+            derives it and emits task_list_set.
+          type: array
+          items:
+            $ref: ../../components/schemas/goal.yaml#/$defs/schemas/GoalTask
+    GoalCompletionAction:
+      description: >-
+        POST body variant action=requestCompletion — request completion of
+        the active goal and run the audit gate (logical operationId
+        requestGoalCompletion).
+      type: object
+      required:
+        - action
+      properties:
+        action:
+          type: string
+          enum:
+            - requestCompletion
+        reason:
+          type: string
+          description: Why completion is requested (e.g. the GOAL_STATUS signal context).

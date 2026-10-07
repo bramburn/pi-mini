@@ -1,0 +1,255 @@
+description: >-
+  Goal resource for the goal-driven continuous loop. A short, explicitly
+  defined objective plus a blockCompletion-gated task list, folded from the
+  append-only .pi/goals/goal_events.jsonl ledger. File layout: the ledger at
+  .pi/goals/goal_events.jsonl, the accumulator at
+  .pi/goals/.goal-ledger-checkpoint.json, archived goals at
+  .pi/goals/archived/goal_*.md, and running-loop bindings at
+  .pi/loops/bindings-<session-uuid>.json {"loopIds":[...]}.
+type: object
+required:
+  - id
+  - objective
+  - revision
+  - status
+  - taskList
+  - usage
+  - createdAt
+properties:
+  id:
+    description: >-
+      Goal identifier (e.g. "muu69dvt-mtoxvg"), carried as `goalId` on every
+      ledger event.
+    type: string
+    examples:
+      - muu69dvt-mtoxvg
+  objective:
+    description: >-
+      The short, explicitly defined goal the loop works toward. Steering
+      (user prompts mid-run) amends it via a goal_amended event and bumps
+      `revision`.
+    type: string
+    minLength: 1
+    examples:
+      - add /mini settings command
+  revision:
+    description: >-
+      Monotonic amendment counter. Starts at 1 on goal_created; every
+      goal_amended event increments it by 1.
+    type: integer
+    minimum: 1
+    examples:
+      - 3
+  status:
+    description: >-
+      Lifecycle state of the loop. active: working toward the objective.
+      completing: all blockCompletion tasks have evidence; about to request
+      completion. awaiting_audit: completion_requested emitted, audit in
+      flight. complete: audit approved, before archival. archived: terminal;
+      the loop has stopped and the goal was written to
+      .pi/goals/archived/goal_*.md.
+    type: string
+    enum:
+      - active
+      - completing
+      - awaiting_audit
+      - complete
+      - archived
+    examples:
+      - active
+  taskList:
+    description: >-
+      Decomposed tasks set via task_list_set. Only tasks with
+      blockCompletion: true gate completion; the loop may finish without
+      non-blocking tasks done, but they must still be reported in the audit.
+    type: array
+    items:
+      $ref: "#/$defs/schemas/GoalTask"
+  usage:
+    description: >-
+      Accumulated loop usage: tokens consumed across all loop turns and wall
+      time the loop was actively running (paused time excluded).
+    type: object
+    required:
+      - tokensUsed
+      - activeSeconds
+    properties:
+      tokensUsed:
+        type: integer
+        minimum: 0
+        examples:
+          - 694061
+      activeSeconds:
+        type: integer
+        minimum: 0
+        examples:
+          - 11196
+  stopReason:
+    description: >-
+      Why the loop stopped, set on the terminal transition. e.g.
+      "audit_approved", "user_stop", "error".
+    type: string
+    examples:
+      - audit_approved
+  createdAt:
+    description: ISO-8601 timestamp of goal_created.
+    type: string
+    format: date-time
+    examples:
+      - "2026-10-07T09:00:00.000Z"
+  amendedAt:
+    description: ISO-8601 timestamp of the most recent goal_amended, if any.
+    type: string
+    format: date-time
+    examples:
+      - "2026-10-07T09:30:00.000Z"
+
+$defs:
+  schemas:
+    GoalTask:
+      description: >-
+        One task in the goal's task list. `verificationContract` states what
+        evidence makes the task complete; `evidence` records the proof quoted
+        on the task_complete ledger event.
+      type: object
+      required:
+        - id
+        - title
+        - blockCompletion
+        - verificationContract
+        - status
+      properties:
+        id:
+          type: string
+          examples:
+            - settings-command
+        title:
+          type: string
+          examples:
+            - Add /mini settings command with subcommand dispatch
+        blockCompletion:
+          type: boolean
+          description: >-
+            true = the goal cannot complete until this task carries evidence;
+            false = advisory, reported in the audit but not gating.
+          examples:
+            - true
+        verificationContract:
+          type: string
+          description: >-
+            The verification that must hold for task_complete to be accepted,
+            e.g. "node --test passes with 0 failures covering the new
+            dispatch".
+          examples:
+            - settings.test.ts covers the new dispatch; node --test green
+        evidence:
+          type: string
+          description: Proof quoted from the task_complete ledger event.
+          examples:
+            - settings.test.ts 9/9 pass; /mini settings status shows the menu
+        status:
+          type: string
+          enum:
+            - pending
+            - in_progress
+            - complete
+          examples:
+            - in_progress
+    GoalAmendment:
+      description: >-
+        Payload of a steering amendment. A user prompt mid-run amends the
+        objective and/or patches the task list. At least one of objective or
+        taskListOps must be present. Applied as a goal_amended ledger event;
+        increments the goal revision by 1.
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          description: Why the goal was amended (usually the user's verbatim steering prompt).
+          type: string
+          examples:
+            - also do X
+        objective:
+          description: Replacement objective; omitted when only the task list changes.
+          type: string
+          examples:
+            - add /mini settings command and a /mini goal command
+        taskListOps:
+          description: Ordered task-list patch operations applied to the current list.
+          type: array
+          items:
+            $ref: "#/$defs/schemas/TaskListOp"
+    TaskListOp:
+      description: >-
+        One patch operation in GoalAmendment.taskListOps. `add` appends a
+        task (with blockCompletion and verificationContract); `remove` deletes
+        by id; `update` replaces title/blockCompletion/verificationContract of
+        an existing task; `complete` marks a task complete with evidence (used
+        when steering retroactively accepts work).
+      type: object
+      required:
+        - op
+      properties:
+        op:
+          type: string
+          enum:
+            - add
+            - remove
+            - update
+            - complete
+        task:
+          $ref: "#/$defs/schemas/GoalTask"
+        taskId:
+          type: string
+          description: Target task id for remove/update/complete.
+        evidence:
+          type: string
+          description: Evidence for op=complete.
+    TaskListSet:
+      description: >-
+        Payload fragment of the task_list_set ledger event: the task list
+        snapshot at set time, with per-task blockCompletion flags.
+      type: object
+      required:
+        - tasks
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: "#/$defs/schemas/GoalTask"
+    TaskStarted:
+      description: >-
+        Payload fragment of the task_started ledger event.
+      type: object
+      required:
+        - goalId
+        - taskId
+      properties:
+        goalId:
+          type: string
+        taskId:
+          type: string
+        at:
+          type: string
+          format: date-time
+    TaskComplete:
+      description: >-
+        Payload fragment of the task_complete ledger event: evidence is
+        mandatory — a task_complete without evidence is rejected by the
+        reducer.
+      type: object
+      required:
+        - goalId
+        - taskId
+        - evidence
+      properties:
+        goalId:
+          type: string
+        taskId:
+          type: string
+        evidence:
+          type: string
+        at:
+          type: string
+          format: date-time

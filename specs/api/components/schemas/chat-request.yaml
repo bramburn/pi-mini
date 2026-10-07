@@ -1,0 +1,2 @@
+description: "TODO(ollama) — /api/chat request body: model, messages, think:false, tools, pinned num_ctx, num_predict cap."
+type: object

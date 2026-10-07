@@ -1,0 +1,61 @@
+we want to have the Mini Lubasan to be similar to Root Code or Klein back in the day where it would continuously loop through but the one thing what we want to do is to also ensure that it has a good way of knowing what it's supposed to be doing as a task so taking in any, steering or user prompt would either would need to amend the kind of a task, goal. In that sense, it's similar to how goals currently work, where we would have a short goal for the large language model to try to adhere to what we want to also get is have the loop continuously, proceed with, Accomplishing the task. and the goal would need to be defined, and it would continuously loop through until that's done, ohh my way is that we set up the PI mini but we also want to have a Pi mini settings page where we still have like a searchable browsable list of the models available on the Pydev so that it works exactly the same as the slash models where the user can see the list of the models Scroll down and as well as search type hint but the one that we want is Pi mini settings and then it would show a menu of items that the user can select what we want to do to have is allow the users to select a model for the for the what's it called for the small local language model? But it is focus on local models. So we would need to have check if we have good setup for lama or lama, CPP whatever. But those will be kind of the default ones we would aim to go for, so the user the slash mini, Pi mini or mini settings and go into it and it has the option to first option is to one enable it and second we would have the ability to go into and fire select the model that we want to assign, 2D Pi model Pi mini model mode so that it does its work on that and obviously the architecture and loop is slightly different, the tool usage are again different because it is a lot smaller context, we don't want it to overwhelm it with too many things. Additionally, I've noticed that some repo have a large agents MD file, so it might be useful to have a mini agents MD recognition where it doesn't load the agents dot MD file in in its entirety because if it's over 1000 token, you're losing a lot. So if it's over 1000 token, we should prompt the user to ask it do they want to load a smaller or build a summarised version of that into a mini agents MD which allows us to use that instead of the agents MD file and it should recognise, the main Reaper only, and I dearly avoid putting offers, other folders, sub folders, mini agents because we don't want to context over the agent, and same goes with the system MD. But we need to have that and it will be ideal to, set this up so that we don't have this kind of issue and it needs to be comprehensive enough for us to use this and properly manage the context and loop, window, I want you for this. Now. produce a very detailed spec. Folder, with Subphotos detailing the specification and the changes we need for this a transcribed objective that we want. There's multiple features. And we want to make sure that every every feature is tested in silo before implementation. So within this specification you can run tests locally. We already have Olama running and our target model is Granite 4.2 8 billion parameters. This computer has 12 gig of vram you can use earlhammer. It is running and we want it to be a this session to be a testing round as well a spec writing exercise. some guidance on spec output: ```Here is a directory structure showing how specification files across different feature domains and frameworks (OpenAPI, BDD, Protocol Buffers, AsyncAPI, and TypeSpec) fit into a standard Spec-Driven Development project layout:
+
+```text
+my-service/
+├── docs/
+│   └── architecture/
+│       └── ADR-004-spec-driven-design.md
+├── specs/
+│   ├── api/                              # REST / HTTP API specifications
+│   │   ├── openapi.yaml                  # Root OpenAPI 3.1 entry point
+│   │   ├── paths/
+│   │   │   ├── auth/
+│   │   │   │   ├── login.yaml            # Auth feature: POST /v1/auth/login
+│   │   │   │   └── refresh.yaml          # Auth feature: POST /v1/auth/refresh
+│   │   │   └── orders/
+│   │   │       ├── checkout.yaml         # Orders feature: POST /v1/orders/checkout
+│   │   │       └── get-order.yaml        # Orders feature: GET /v1/orders/{id}
+│   │   └── components/
+│   │       ├── schemas/
+│   │       │   ├── user.yaml             # Shared User data contract
+│   │       │   └── order.yaml            # Shared Order data contract
+│   │       └── errors/
+│   │           └── problem-details.yaml  # RFC 7807 error schema
+│   │
+│   ├── features/                         # Behavior-Driven Development (BDD / Gherkin)
+│   │   ├── authentication/
+│   │   │   └── user-login.feature        # Feature: Multi-factor user login
+│   │   └── checkout/
+│   │       ├── apply-discount.feature    # Feature: Promo code calculation logic
+│   │       └── payment-gateway.feature   # Feature: Credit card and Stripe integration
+│   │
+│   ├── async/                            # Event-Driven / Message Queue specifications
+│   │   └── asyncapi.yaml                 # AsyncAPI spec for Kafka / RabbitMQ events
+│   │
+│   ├── proto/                            # gRPC / Protocol Buffer contracts
+│   │   └── v1/
+│   │       ├── identity_service.proto    # RPC definitions for User Identity
+│   │       └── inventory_service.proto   # RPC definitions for Stock/Inventory
+│   │
+│   └── typespec/                         # Modern Spec-Language source files (optional)
+│       ├── main.tsp                      # Compiler entry point
+│       └── models/
+│           └── payments.tsp              # Payment system types
+│
+├── tests/
+│   ├── contract/                         # Auto-generated contract tests from specs
+│   │   └── openapi_contract_test.go
+│   └── step_definitions/                 # Test runners binding to .feature files
+│       ├── auth_steps.ts
+│       └── checkout_steps.ts
+│
+└── spectral.yaml                         # Linter configuration for spec validation
+
+```
+
+### Key Breakdown of the Structure
+
+* **`specs/api/` (Modular OpenAPI):** Instead of storing thousands of lines in a single monolith file, paths and schemas are split into feature folders (`auth/`, `orders/`) and referenced via `$ref`.
+* **`specs/features/` (Gherkin Scenarios):** Organizes executable acceptance criteria by business capability rather than technical layers.
+* **`specs/async/` & `proto/`:** Houses event streams and microservice RPC definitions alongside HTTP API specs to maintain a single source of truth across communication protocols.
+* **`spectral.yaml`:** Configuration for automatically linting specifications during CI/CD to enforce team style guides and breaking change checks.```

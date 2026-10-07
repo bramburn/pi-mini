@@ -1,0 +1,26 @@
+asyncapi: 3.0.0
+info:
+  title: pi-mini asynchronous surfaces
+  version: 0.3.0
+  contact:
+    name: pi-mini maintainers
+  license:
+    name: MIT
+  tags:
+    - name: ollama
+    - name: goal-loop
+  description: >-
+    AsyncAPI 3.0 root for pi-mini's event-driven surfaces: the Ollama NDJSON
+    chat stream and the .pi/goals goal ledger event stream.
+x-feature: root
+servers:
+  ollama:
+    host: localhost:11434
+    pathname: /api
+    protocol: http
+    description: Local Ollama runtime (default, spec'd)
+channels:
+  ollamaNdjson:
+    $ref: channels/ollama-ndjson.yaml
+  goalLedger:
+    $ref: channels/goal-ledger.yaml

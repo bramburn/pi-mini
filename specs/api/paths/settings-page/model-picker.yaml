@@ -1,0 +1,57 @@
+description: >-
+  /mini/settings-page/model-picker — the data source behind the /mini settings
+  local-model picker. It consumes GET /api/tags from the local Ollama runtime
+  (see paths/ollama/tags.yaml and the ModelList schema), merges the payload
+  with local-runtime entries from pi's modelRegistry, filters out remote
+  (minimax/openai/anthropic-class) providers per the ModelList
+  x-local-filter-rule decision table, and feeds the searchable picker UI that
+  mirrors pi's /model ModelSelectorComponent (fuzzyFilter type-to-search,
+  10-row sliding window, wrap-around navigation, ✓ on the current model,
+  (n/total) indicator). The picker is opened from the /mini settings menu as
+  the action that assigns the tiny model slot.
+get:
+  operationId: listLocalModels
+  summary: List local-runtime models for the settings-page picker (merged, filtered, optionally searched)
+  description: >-
+    Returns the merged, local-only picker list as an array of PickerModelEntry
+    (see the ModelList schema $defs). Data flow: (1) GET http://localhost:11434/api/tags
+    — unreachable Ollama must NOT fail the request; instead the response
+    carries a warning and falls back to registry-only local entries (source
+    "registry", pulled=false); (2) merge with registry entries whose provider
+    is a LocalRuntimeTag, dedup by (provider, modelId) with the ollama-tags
+    copy winning, annotate each entry with its `source` discriminator; (3)
+    filter per the decision table — /api/tags entries, provider "ollama",
+    provider "ollama-mini", and provider "llama-cpp" are LOCAL, remote
+    providers are EXCLUDED; (4) sort current-model-first, then provider
+    alphabetical; (5) when the `q` parameter is present, apply the pi-tui
+    fuzzyFilter over `provider/modelId` text (whitespace/slash-tokenized
+    subsequence match, best score first); an empty `q` returns the full list.
+  tags:
+    - settings-page
+  parameters:
+    - name: q
+      in: query
+      required: false
+      description: Fuzzy search query applied over "provider/modelId" text; omit or empty to list everything.
+      schema:
+        type: string
+    - name: current
+      in: query
+      required: false
+      description: >-
+        "provider/modelId" of the config's tiny model; the matching entry is
+        marked current=true and sorted first.
+      schema:
+        type: string
+  responses:
+    "200":
+      description: >-
+        Merged local-model list. `x-ollama-unreachable: true` is set (with an
+        `x-ollama-warning` string) when GET /api/tags failed and only registry
+        entries are present.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: ../../components/schemas/model-list.yaml#/$defs/PickerModelEntry

@@ -1,0 +1,54 @@
+openapi: 3.1.0
+info:
+  title: pi-mini specification API
+  version: 0.3.0
+  contact:
+    name: pi-mini maintainers
+  description: >-
+    Modular OpenAPI 3.1 root for the pi-mini extension. Paths and schemas are
+    split into per-feature placeholder files under specs/api/paths/ and
+    specs/api/components/schemas/; feature agents fill them in.
+x-feature: root
+servers:
+  - url: http://localhost:11434
+    description: Local Ollama runtime (default, spec'd); llama.cpp is the named alternative local runtime
+tags:
+  - name: ollama
+    description: Ollama native HTTP API surfaces used by pi-mini (/api/chat NDJSON stream, /api/tags)
+  - name: config
+    description: pi-mini runtime configuration (~/.pi/agent/pi-mini.json, PiMiniConfig)
+  - name: goal-loop
+    description: Goal-driven continuous loop state (reuses .pi/goals ledger vocabulary)
+  - name: settings-page
+    description: /mini settings submenu including the local-model picker
+  - name: mini-context
+    description: Mini AGENTS.md context budgeting
+paths:
+  /api/chat:
+    $ref: paths/ollama/chat.yaml
+  /api/tags:
+    $ref: paths/ollama/tags.yaml
+  /mini/config/settings:
+    $ref: paths/config/settings.yaml
+  /mini/goal-loop/goal-state:
+    $ref: paths/goal-loop/goal-state.yaml
+  /mini/settings-page/model-picker:
+    $ref: paths/settings-page/model-picker.yaml
+  /mini/mini-context/context-budget:
+    $ref: paths/mini-context/context-budget.yaml
+components:
+  schemas:
+    ChatRequest:
+      $ref: components/schemas/chat-request.yaml
+    ChatResponse:
+      $ref: components/schemas/chat-response.yaml
+    ModelList:
+      $ref: components/schemas/model-list.yaml
+    PiMiniConfig:
+      $ref: components/schemas/pi-mini-config.yaml
+    Goal:
+      $ref: components/schemas/goal.yaml
+    AuditResult:
+      $ref: components/schemas/audit-result.yaml
+    ContextBudget:
+      $ref: components/schemas/context-budget.yaml

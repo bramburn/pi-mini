@@ -1,0 +1,1 @@
+description: "TODO(ollama) — POST /api/chat: NDJSON stream with think:false, pinned num_ctx, num_predict cap, 90s stall watchdog. See ollama-native.ts."
