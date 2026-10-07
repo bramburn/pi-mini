@@ -19,8 +19,33 @@ import {
 	TINY_MODEL_ID,
 	TINY_PROVIDER,
 	toolsForMode,
+	type ModelRef,
 } from "./settings.ts";
 import { stripToolCallSpans } from "./wrapfix.ts";
+import { installRepair } from "./repair.ts";
+import {
+	amendGoal,
+	buildAuditMessages,
+	buildGoalPromptBlock,
+	cancelGoal,
+	GoalStore,
+	installGoalLoop,
+	parseAuditResponse,
+	startGoal,
+	type AuditVerdict,
+	type Goal,
+	type GoalLoopPi,
+} from "./goal-loop.ts";
+import { showSettingsMenu, type SettingsMenuDeps } from "./mini-settings.ts";
+import {
+	ensureMiniContext,
+	installMiniContext,
+	refresh as refreshMiniContextModule,
+	resolveInstructions,
+} from "./mini-context.ts";
+import { parseMiniCommand, type MiniGoalOp, type ParsedMiniCommand } from "./mini-command.ts";
+
+export { parseMiniCommand, type MiniGoalOp, type ParsedMiniCommand } from "./mini-command.ts";
 
 /**
  * pi-mini: run a tiny local LLM as the session model with pi's native agentic
@@ -51,12 +76,18 @@ interface ModeState {
 	internalModelChange: boolean;
 	delegations: number;
 	wrapfixCalls: number;
+	/** One-shot notify when the composed system prompt had to drop blocks. */
+	promptTrimNotified: boolean;
 }
 
 // Wrap-fix conversions per user turn. Dictated/repeated JSON text converts and
 // executes once or twice, then further repeats are blocked so a model that
 // re-emits its dictation after every tool result cannot loop executions forever.
 const MAX_WRAPFIX_CONVERSIONS_PER_TURN = 2;
+
+// Composed-prompt ceiling: base mini prompt + goal block (≤4096B) +
+// mini-context block (≤4096B) must stay under this; blocks drop on overflow.
+const PROMPT_COMPOSE_BUDGET = 6000;
 
 const state: ModeState = {
 	enabled: false,
@@ -65,7 +96,90 @@ const state: ModeState = {
 	internalModelChange: false,
 	delegations: 0,
 	wrapfixCalls: 0,
+	promptTrimNotified: false,
 };
+
+const USAGE =
+	"Usage: /mini [on|off|tiny|large|status|settings|goal <objective>|goal amend <text>|goal cancel]";
+
+/**
+ * Shared goal ledger for /mini goal and the goal loop. Default location is
+ * <cwd>/.pi/goals/goal_events.jsonl (goal-loop.ts GoalStore).
+ */
+const sharedGoalStore = new GoalStore();
+
+// ---------------------------------------------------------------------------
+// Mini-context prompt block cache. Recomputed on enable and on session_start
+// (via refreshMiniContext below), never per turn; resolveInstructions failures
+// resolve to an empty block so a broken context file can never break a turn.
+// ---------------------------------------------------------------------------
+let miniCtxBlockCache: string | null = null;
+/** The exact ctx object installMiniContext was called with (WeakMap-keyed). */
+let miniContextInstalledCtx: ExtensionContext | null = null;
+
+function safeResolveMiniContext(cwd: string): string {
+	try {
+		return resolveInstructions({ cwd }).block;
+	} catch {
+		return "";
+	}
+}
+
+function currentMiniContextBlock(cwd: string): string {
+	if (miniCtxBlockCache === null) miniCtxBlockCache = safeResolveMiniContext(cwd);
+	return miniCtxBlockCache;
+}
+
+/**
+ * Re-check instruction files after enable / session start: run the module's
+ * ensure pass (settle any summarize prompts) on the installed session ctx —
+ * or directly on the given ctx when mini-context was not installed for it —
+ * then refresh the cached prompt block.
+ */
+async function refreshMiniContext(ctx: ExtensionContext): Promise<void> {
+	try {
+		if (miniContextInstalledCtx) {
+			await refreshMiniContextModule(miniContextInstalledCtx);
+		} else {
+			await ensureMiniContext(ctx, {
+				cwd: ctx.cwd,
+				cfg: loadConfig(),
+				isEnabled: () => state.enabled,
+			});
+		}
+	} catch (error) {
+		ctx.ui.notify(
+			`pi-mini: mini-context refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+			"warning",
+		);
+	}
+	miniCtxBlockCache = safeResolveMiniContext(ctx.cwd);
+}
+
+/**
+ * goalAudit "worker" audit: hand the completion claims to the configured large
+ * model through the same runWorker path the delegate_to_worker tool uses
+ * (empty transcript — buildAuditMessages embeds everything the auditor needs),
+ * then parse the AUDIT_VERDICT contract out of the worker's report.
+ */
+async function delegateAudit(goal: Goal): Promise<{ verdict: AuditVerdict; report: string }> {
+	const cfg = loadConfig();
+	if (!cfg.large) throw new Error("no large model configured, run /mini large");
+	const [auditorSystem, auditorUser] = buildAuditMessages(goal);
+	const result = await runWorker({
+		large: cfg.large,
+		task:
+			`${auditorSystem}\n\n${auditorUser}\n\n` +
+			"Reply with the exact line `AUDIT_VERDICT: approved` or `AUDIT_VERDICT: disapproved`, " +
+			"followed by a short audit report (at most 5 sentences). When disapproved, end with a line " +
+			"starting `CONTINUATION: ` followed by concrete next steps for the agent.",
+		entries: [],
+		cwd: process.cwd(),
+	});
+	if (!result.ok) throw new Error(`worker audit failed: ${result.text}`);
+	const parsed = parseAuditResponse(result.text);
+	return { verdict: parsed.verdict, report: parsed.report };
+}
 
 export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------------
@@ -111,12 +225,98 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// ---------------------------------------------------------------------
-	// Per-turn system prompt replacement while mini mode is active.
+	// New module wiring. The extension factory only receives `pi`, so the
+	// context-dependent installs (mini-context) capture the live session ctx
+	// on session_start; repair's ctx param is documented as unused.
 	// ---------------------------------------------------------------------
-	pi.on("before_agent_start", (_event, ctx) => {
+	installRepair(pi, undefined as unknown as ExtensionContext, {
+		isEnabled: () => state.enabled,
+		getConfig: loadConfig,
+	});
+
+	// Registered BEFORE index's own before_agent_start handler: pi chains
+	// systemPrompt results across handlers, so this composes the goal block
+	// underneath the composed mini prompt below (index's handler replaces the
+	// chain wholesale and re-adds the goal block itself, deduplicated via the
+	// "## Active Goal" marker guard). GoalLoopPi is the module's narrower
+	// structural view of the same pi object.
+	installGoalLoop(pi as unknown as GoalLoopPi, undefined, {
+		isEnabled: () => state.enabled,
+		getConfig: loadConfig,
+		store: sharedGoalStore,
+		delegateAudit,
+	});
+
+	// ---------------------------------------------------------------------
+	// Session start: install mini-context on the live session ctx (first
+	// session only; its ctx is WeakMap-keyed by refresh()), invalidate the
+	// cached context block, and auto-enter mini mode when the persisted
+	// config says so. Never throws into extension init.
+	// ---------------------------------------------------------------------
+	pi.on("session_start", (_event, sctx) => {
+		miniCtxBlockCache = null;
+		if (!miniContextInstalledCtx) {
+			miniContextInstalledCtx = sctx;
+			installMiniContext(pi, sctx, { getConfig: loadConfig, isEnabled: () => state.enabled });
+		}
+		if (loadConfig().enabled && !state.enabled) {
+			void (async () => {
+				try {
+					await enable(pi, sctx as unknown as ExtensionCommandContext);
+					if (state.enabled) sctx.ui.notify("pi-mini: auto-enabled from settings", "info");
+				} catch (error) {
+					sctx.ui.notify(
+						`pi-mini: auto-enable failed: ${error instanceof Error ? error.message : String(error)}`,
+						"warning",
+					);
+				}
+			})();
+		}
+	});
+
+	// ---------------------------------------------------------------------
+	// Per-turn system prompt replacement while mini mode is active:
+	// MINI_SYSTEM_PROMPT + goal block (when a goal is active) + cached
+	// <mini_context> block, with a size guard that drops the context block
+	// first, then the goal block, notifying once per enable session.
+	// ---------------------------------------------------------------------
+	pi.on("before_agent_start", (event, ctx) => {
 		if (!state.enabled) return undefined;
 		if (!isTinyModel(ctx)) return undefined; // user overrode the model; leave the prompt alone
-		return { systemPrompt: MINI_SYSTEM_PROMPT };
+
+		let goalBlock = "";
+		const goal = sharedGoalStore.current();
+		// installGoalLoop's own chained handler may have composed the same block
+		// already; never duplicate it.
+		if (goal && !event.systemPrompt.includes("## Active Goal")) {
+			try {
+				goalBlock = buildGoalPromptBlock(goal);
+			} catch {
+				goalBlock = ""; // block could not fit its own budget: prompt stands without it
+			}
+		}
+		const ctxBlock = currentMiniContextBlock(ctx.cwd);
+
+		const compose = (g: string, c: string): string => [MINI_SYSTEM_PROMPT, g, c].filter(Boolean).join("\n\n");
+		let prompt = compose(goalBlock, ctxBlock);
+		let dropped: string | null = null;
+		if (Buffer.byteLength(prompt, "utf8") > PROMPT_COMPOSE_BUDGET && ctxBlock) {
+			prompt = compose(goalBlock, "");
+			dropped = "mini-context";
+		}
+		if (Buffer.byteLength(prompt, "utf8") > PROMPT_COMPOSE_BUDGET && goalBlock) {
+			prompt = MINI_SYSTEM_PROMPT;
+			dropped = dropped ? `${dropped} + goal` : "goal";
+		}
+		if (dropped && !state.promptTrimNotified) {
+			state.promptTrimNotified = true;
+			ctx.ui.notify(
+				`pi-mini: composed system prompt exceeds ${PROMPT_COMPOSE_BUDGET} bytes; ` +
+					`dropped the ${dropped} block(s) for this session`,
+				"warning",
+			);
+		}
+		return { systemPrompt: prompt };
 	});
 
 	// ---------------------------------------------------------------------
@@ -211,36 +411,169 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("mini", {
 		description: "Mini mode: tiny local LLM on the native tool loop, delegating large work to a worker",
 		getArgumentCompletions: (prefix) => {
-			const candidates = ["on", "off", "tiny", "large", "status"];
+			const candidates = ["on", "off", "tiny", "large", "status", "settings", "goal", "goal amend", "goal cancel"];
 			return candidates
 				.filter((c) => c.startsWith(prefix.trim().toLowerCase()))
 				.map((c) => ({ value: c, label: c, description: completionDescription(c) }));
 		},
 		handler: async (args, ctx) => {
-			const sub = args.trim().toLowerCase();
-			switch (sub) {
+			const parsed = parseMiniCommand(args);
+			if (!parsed) {
+				ctx.ui.notify(USAGE, "info");
+				return;
+			}
+			if (parsed.goal) {
+				await handleGoalCommand(pi, ctx, parsed.goal);
+				return;
+			}
+			switch (parsed.sub) {
 				case "":
-					if (state.enabled) await disable(pi, ctx, { restoreModel: true, notify: true });
+					if (state.enabled) await disableAndReportGoal(pi, ctx, { restoreModel: true, notify: true });
 					else await enable(pi, ctx);
 					break;
 				case "on":
 					await enable(pi, ctx);
 					break;
 				case "off":
-					await disable(pi, ctx, { restoreModel: true, notify: true });
+					await disableAndReportGoal(pi, ctx, { restoreModel: true, notify: true });
 					break;
 				case "tiny":
 				case "large":
-					await configureModel(pi, ctx, sub);
+					await configureModel(pi, ctx, parsed.sub);
 					break;
 				case "status":
 					reportStatus(ctx);
 					break;
-				default:
-					ctx.ui.notify("Usage: /mini [on|off|tiny|large|status]", "info");
+				case "settings":
+					await showSettingsMenu(ctx, settingsMenuDeps(pi, ctx));
+					break;
 			}
 		},
 	});
+}
+
+/**
+ * /mini goal handler: start/amend gate on mini mode (the loop's prompt seam
+ * only exists while enabled); status/cancel work regardless. Kickoff steering
+ * goes through pi.sendUserMessage as a steer message.
+ */
+async function handleGoalCommand(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	goalCmd: { op: MiniGoalOp; text: string },
+): Promise<void> {
+	switch (goalCmd.op) {
+		case "status": {
+			const goal = sharedGoalStore.current();
+			ctx.ui.notify(
+				goal
+					? `pi-mini: goal — ${goal.objective} (revision ${goal.revision}, ${goal.status})`
+					: "pi-mini: no active goal",
+				"info",
+			);
+			return;
+		}
+		case "cancel": {
+			const goal = cancelGoal(sharedGoalStore);
+			ctx.ui.notify(goal ? "pi-mini: goal cancelled" : "pi-mini: no active goal to cancel", "info");
+			return;
+		}
+		case "amend": {
+			if (!goalCmd.text) {
+				ctx.ui.notify("Usage: /mini goal amend <text>", "info");
+				return;
+			}
+			if (!state.enabled) {
+				ctx.ui.notify("pi-mini: goal requires mini mode — run /mini on first", "warning");
+				return;
+			}
+			const goal = amendGoal(sharedGoalStore, goalCmd.text);
+			if (!goal) {
+				ctx.ui.notify("pi-mini: no active goal to amend", "info");
+				return;
+			}
+			pi.sendUserMessage(
+				`The active goal was amended (now revision ${goal.revision}): ${goalCmd.text}\n` +
+					"Re-check your open tasks against this amendment, then continue working toward the goal.",
+				{ deliverAs: "steer" },
+			);
+			ctx.ui.notify(`pi-mini: goal amended (revision ${goal.revision})`, "info");
+			return;
+		}
+		case "start": {
+			if (!state.enabled) {
+				ctx.ui.notify("pi-mini: goal requires mini mode — run /mini on first", "warning");
+				return;
+			}
+			const goal = startGoal(sharedGoalStore, goalCmd.text);
+			pi.sendUserMessage(
+				`A goal is now active: ${goal.objective}\n` +
+					"Work toward it autonomously using your tools. Track your tasks as you go. " +
+					"When every blocking task is verifiably complete, end your reply with the exact line " +
+					"`GOAL_STATUS: complete`. If you cannot proceed, emit `GOAL_STATUS: blocked — <reason>` instead.",
+				{ deliverAs: "steer" },
+			);
+			ctx.ui.notify(`pi-mini: goal started (revision ${goal.revision})`, "info");
+			return;
+		}
+	}
+}
+
+/**
+ * /mini off (and the toggle-off path): keep the goal loop independent of mini
+ * mode — it stays in the ledger — but tell the user how to stop it.
+ */
+async function disableAndReportGoal(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	opts: { restoreModel: boolean; notify: boolean },
+): Promise<void> {
+	await disable(pi, ctx, opts);
+	const goal = sharedGoalStore.current();
+	if (goal) ctx.ui.notify("pi-mini: goal still active; /mini goal cancel to stop", "info");
+}
+
+/**
+ * Dependencies the settings menu needs from the session: the enable toggle
+ * persists cfg.enabled and applies the transition; applyTinyModel persists
+ * the ref and live-switches through the same guarded setModel path
+ * configureModel uses (provider re-registration for ollama-mini refs);
+ * applyLargeModel only persists (no live switch, matching configureModel).
+ */
+function settingsMenuDeps(pi: ExtensionAPI, ctx: ExtensionCommandContext): SettingsMenuDeps {
+	return {
+		getConfig: loadConfig,
+		isEnabled: () => state.enabled,
+		setEnabled: async (on) => {
+			saveConfig({ ...loadConfig(), enabled: on });
+			if (on) await enable(pi, ctx);
+			else await disable(pi, ctx, { restoreModel: true, notify: true });
+		},
+		applyTinyModel: async (ref: ModelRef) => {
+			const cfg = loadConfig();
+			cfg.tiny = ref;
+			saveConfig(cfg);
+			if (state.enabled) {
+				let model = ctx.modelRegistry.find(ref.provider, ref.modelId);
+				if (!model && ref.provider === TINY_PROVIDER) {
+					registerTinyProvider(pi, cfg);
+					model = ctx.modelRegistry.find(ref.provider, ref.modelId);
+				}
+				if (model) {
+					state.internalModelChange = true;
+					try {
+						await pi.setModel(model);
+					} finally {
+						state.internalModelChange = false;
+					}
+				}
+			}
+			updateStatus(ctx);
+		},
+		applyLargeModel: async (ref: ModelRef) => {
+			saveConfig({ ...loadConfig(), large: ref });
+		},
+	};
 }
 
 function completionDescription(candidate: string): string {
@@ -254,7 +587,15 @@ function completionDescription(candidate: string): string {
 		case "large":
 			return "Pick the large worker model";
 		case "status":
-			return "Show current pi-mini state";
+			return "Show current pi-mini state (incl. goal, repair, context)";
+		case "settings":
+			return "Open the settings menu (enable toggle + model pickers)";
+		case "goal":
+			return "Start an autonomous goal loop (usage: /mini goal <objective>)";
+		case "goal amend":
+			return "Amend the active goal with steering text (bumps revision)";
+		case "goal cancel":
+			return "Cancel the active goal loop";
 		default:
 			return "";
 	}
@@ -385,7 +726,11 @@ async function enable(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<v
 	state.enabled = true;
 	state.delegations = 0;
 	state.wrapfixCalls = 0;
+	state.promptTrimNotified = false;
 	updateStatus(ctx);
+	// Settle any pending mini-context summarize prompts and refresh the cached
+	// prompt block (covers /mini on, /mini settings enable, and auto-start).
+	void refreshMiniContext(ctx).catch(() => {});
 	ctx.ui.notify(
 		`pi-mini: ON — tiny ${formatRef(cfg.tiny)} on the native tool loop ` +
 			`(${[...new Set([...wanted, DELEGATE_TOOL])].join(", ")}), worker ${formatRef(cfg.large)}, think ${cfg.think ? "on" : "off"}`,
@@ -470,6 +815,23 @@ function reportStatus(ctx: ExtensionCommandContext): void {
 		`tools: ${cfg.toolsMode}`,
 		`delegate budget: ${cfg.delegateBudget}/turn`,
 	];
+	const goal = sharedGoalStore.current();
+	const objective = goal ? goal.objective : null;
+	lines.push(
+		`goal: ${goal ? `${objective && objective.length > 60 ? `${objective.slice(0, 60)}…` : objective} (rev ${goal.revision}, ${goal.status})` : "none"}`,
+	);
+	lines.push(
+		`repair: tool-result repair on (≤${cfg.repairMaxAttemptsPerCall}/call, ≤${cfg.repairMaxPerTurn}/turn)`,
+	);
+	lines.push(
+		`mini-context: ${
+			miniCtxBlockCache === null
+				? "not evaluated yet this session"
+				: miniCtxBlockCache
+					? `${Buffer.byteLength(miniCtxBlockCache, "utf8")}B in system prompt`
+					: "nothing to inject"
+		}`,
+	);
 	if (state.enabled) lines.push(`delegations this turn: ${state.delegations}`);
 	ctx.ui.notify(lines.join("\n"), "info");
 }

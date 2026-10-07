@@ -22,12 +22,31 @@ subprocess). Toggling off restores the previous model and tools.
   (`read/edit/find/grep/bash` — `find` is pi's glob tool) plus
   `delegate_to_worker`. Per-user-turn budgets: 2 wrap-fix conversions
   (blocks + terminates repeats) and a configurable delegate budget (default 8).
+  Also wires in `repair.ts` (tool-result repair), `goal-loop.ts` (autonomous
+  goal ledger + audit), `mini-settings.ts` (`/mini settings` menu), and
+  `mini-context.ts` (instruction-file budget + `<mini_context>` prompt block).
 - **Dictation carve-out** — the tiny system prompt tells the model to answer
   explicit "output/dictate/repeat this verbatim" requests as plain text.
 
 ## Commands
 
-`/mini [on|off|tiny|large|status]`
+```
+/mini                                  toggle mini mode on/off
+/mini on | off | status
+/mini tiny | large                     pick the tiny / large-worker model
+/mini settings                         two-step settings menu (enable toggle + pickers)
+/mini goal <objective>                 start an autonomous goal loop (mini mode required)
+/mini goal                             show the current goal status
+/mini goal amend <text>                steer the active goal (bumps its revision)
+/mini goal cancel                      stop the active goal loop
+```
+
+Final usage string: `/mini [on|off|tiny|large|status|settings|goal <objective>|goal amend <text>|goal cancel]`
+
+The goal loop is event-sourced to `.pi/goals/goal_events.jsonl`; completion is
+audited per `goalAudit` (`self` = the tiny model, `worker` = delegate_to_worker
+to the large model) before the goal archives. Turning mini mode off does **not**
+cancel an active goal — run `/mini goal cancel`.
 
 ## Config — `~/.pi/agent/pi-mini.json`
 
@@ -37,12 +56,21 @@ subprocess). Toggling off restores the previous model and tools.
   "large": { "provider": "minimax", "modelId": "MiniMax-M3" },
   "think": false,
   "toolsMode": "curated",
-  "delegateBudget": 8
+  "delegateBudget": 8,
+  "enabled": false,
+  "goalAudit": "self",
+  "repairMaxAttemptsPerCall": 2,
+  "repairMaxPerTurn": 2
 }
 ```
 
 - `think` — granite-style thinking toggle for the tiny model (off = fast tool loops).
 - `toolsMode` — `curated` | `all` | `read-only` (plus `delegate_to_worker` always).
+- `enabled` — when `true`, new sessions auto-enter mini mode on start.
+- `goalAudit` — who audits goal completion: `self` (mini self-audit) or `worker`
+  (delegated to the large model).
+- `repairMaxAttemptsPerCall` / `repairMaxPerTurn` — bounds for the tool-result
+  repair loop (isolated fixer calls against the tiny model).
 - Legacy configs are migrated automatically; the `ollama-mini` provider is
   pi-mini's own and never touches your `ollama` catalogue in `models.json`.
 - Non-`ollama-mini` tiny models work but run on their provider's stock API
@@ -71,3 +99,11 @@ resolves pi's own packages inside the pi process.)
 - Very long single-string tool arguments can stall at the model level; the
   watchdog turns that into a tool error instead of a hang. Prefer `edit` with
   small arguments or `delegate_to_worker` for big writes.
+- Tool-result repair cannot re-execute a built-in tool from an extension, so a
+  successful repair rewrites the failed tool_result into a compact REISSUE
+  notice (corrected JSON embedded verbatim); the model re-issues the identical
+  call on its next turn and it executes through pi's normal loop. Semantic and
+  transient failures are never repaired (zero extra LLM calls).
+- The composed mini system prompt (base + goal block + mini-context block) is
+  capped at ~6000 bytes; on overflow the mini-context block is dropped first,
+  then the goal block, with a one-time warning.

@@ -19,6 +19,16 @@ export interface PiMiniConfig {
 	toolsMode: ToolsMode;
 	/** Max delegate_to_worker calls per user turn. */
 	delegateBudget: number;
+	/** Persisted enable flag written by the /mini settings page. When true, new
+	 * sessions auto-enter mini mode. /mini on|off remains session-only. */
+	enabled: boolean;
+	/** Who audits goal completion: "self" (mini self-audit) or "worker"
+	 * (delegate_to_worker to the large model). */
+	goalAudit: "self" | "worker";
+	/** Max isolated-repair attempts for a single failed tool call. */
+	repairMaxAttemptsPerCall: number;
+	/** Max isolated tool-call repair calls per user turn. */
+	repairMaxPerTurn: number;
 }
 
 // Native Ollama provider owned by pi-mini. Kept distinct from the user's own
@@ -32,6 +42,9 @@ export const TINY_MAX_TOKENS = 8_192;
 
 export const DELEGATE_TOOL = "delegate_to_worker";
 export const DEFAULT_DELEGATE_BUDGET = 8;
+export const DEFAULT_GOAL_AUDIT: "self" | "worker" = "self";
+export const DEFAULT_REPAIR_MAX_ATTEMPTS_PER_CALL = 2;
+export const DEFAULT_REPAIR_MAX_PER_TURN = 2;
 
 /** pi built-in tool names for the curated sets (glob-style search is pi's "find"). */
 export const CURATED_TOOLS = ["read", "edit", "find", "grep", "bash"];
@@ -54,6 +67,10 @@ export function defaultConfig(): PiMiniConfig {
 		think: false,
 		toolsMode: "curated",
 		delegateBudget: DEFAULT_DELEGATE_BUDGET,
+		enabled: false,
+		goalAudit: DEFAULT_GOAL_AUDIT,
+		repairMaxAttemptsPerCall: DEFAULT_REPAIR_MAX_ATTEMPTS_PER_CALL,
+		repairMaxPerTurn: DEFAULT_REPAIR_MAX_PER_TURN,
 	};
 }
 
@@ -83,6 +100,14 @@ export function loadConfig(): PiMiniConfig {
 			}
 			if (typeof record.delegateBudget === "number" && record.delegateBudget >= 1) {
 				cfg.delegateBudget = Math.floor(record.delegateBudget);
+			}
+			if (typeof record.enabled === "boolean") cfg.enabled = record.enabled;
+			if (record.goalAudit === "self" || record.goalAudit === "worker") cfg.goalAudit = record.goalAudit;
+			if (typeof record.repairMaxAttemptsPerCall === "number" && record.repairMaxAttemptsPerCall >= 1) {
+				cfg.repairMaxAttemptsPerCall = Math.floor(record.repairMaxAttemptsPerCall);
+			}
+			if (typeof record.repairMaxPerTurn === "number" && record.repairMaxPerTurn >= 1) {
+				cfg.repairMaxPerTurn = Math.floor(record.repairMaxPerTurn);
 			}
 		}
 	} catch {
