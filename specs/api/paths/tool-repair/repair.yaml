@@ -1,0 +1,224 @@
+# REST-shaped operations over the tool-call repair resource. The resource is
+# file-backed and model-backed, not HTTP-served: .pi/mini/tool-repairs.jsonl is
+# the append-only evidence log, the classifier and guardrail state machine are
+# pure logic (tests/unit/lib/tool-call-repair.mjs), and each repair attempt is
+# one small isolated POST /api/chat call (num_ctx 4096, num_predict <=300,
+# think:false, 90s stall watchdog).
+#
+# BOUNDARY WITH WRAPFIX: wrapfix.ts runs PRE-execution (stream level): degraded
+# or truncated JSON tool-call TEXT is repaired into a real toolCall before the
+# done event, capped at 2 conversions per turn. This resource is POST-execution:
+# a call that RAN and FAILED on syntax is extracted into an isolated repair
+# context, re-classified, repaired at most twice, and re-executed — the
+# fallback for whatever slips through wrapfix or fails validation at execution.
+# Semantic failures (valid syntax, wrong meaning) NEVER enter repair; transient
+# failures retry with bounded backoff and no LLM.
+#
+# The scaffold root registers one path for this feature, so the two POST
+# semantics (classify, repair-attempt) share the POST slot and are
+# discriminated by the request body's `action` field — the same convention as
+# paths/goal-loop/goal-state.yaml. The logical operationIds are
+# `runRepairAttempt` (declared on the operation below) and
+# `classifyFailure` (the action=classify variant, documented under
+# x-actionVariants); an RPC adapter exposes both verbatim.
+description: >-
+  Tool-call syntax-failure repair resource (`/mini/tool-repair`). POST
+  classifies a failure (action=classify) or runs one bounded, isolated repair
+  attempt against the tiny model and returns the validated outcome
+  (action=repairAttempt); GET returns the append-only evidence log at
+  .pi/mini/tool-repairs.jsonl. This is the POST-execution complement to the
+  stream-level wrap-fix: wrapfix repairs degraded call TEXT before the done
+  event (2/turn), this loop repairs calls that ran and failed on syntax
+  (2 attempts per call, 2 repair calls per turn, separate counters), and
+  semantic/transient failures never reach the model.
+post:
+  operationId: runRepairAttempt
+  summary: >-
+    POST /tool-repair — classify a tool-call failure (action=classify), or run
+    one isolated repair attempt and return the validated outcome
+    (action=repairAttempt, declared here)
+  description: >-
+    action=classify: pure regex/structural classification of a failed tool
+    call from (toolName, rawArgs, errorText) into syntax-repairable |
+    semantic | transient per the documented pattern table (see
+    components/schemas/tool-repair.yaml, FailureClassification). No model call
+    is made; semantic and transient results are returned to the main loop
+    as-is. This variant exists so the classifier can run without any LLM
+    involvement (e.g. before deciding whether a repair call is allowed).
+
+    action=repairAttempt: builds the isolated repair context — fixer system
+    prompt ("repair ONLY the syntax/structure; preserve the call's intent
+    verbatim; output STRICT JSON only"), the ToolContract summary, the failed
+    rawArgs verbatim, and the FailureClassification, nothing else — and issues
+    one small POST /api/chat call (num_ctx 4096, num_predict <=300,
+    think:false, 90s stall watchdog applies). The reply is extracted with
+    strict-JSON-only parsing (fenced or bare JSON object; brace balancing is
+    tolerated; surrounding prose is rejected) and MUST validate against the
+    ToolContract before the repaired args are accepted. Guardrails: at most 2
+    repair attempts per failed call, each failure re-classified; at most 2
+    repair calls per user turn, counted separately from wrapfix conversions
+    (2/turn) and delegate_to_worker (8/turn); repair calls never recurse; on
+    exhaustion the ORIGINAL error plus the last repair error are surfaced to
+    the main loop as the tool_result (no silent drop); every attempt is
+    appended to .pi/mini/tool-repairs.jsonl.
+  tags:
+    - tool-call-repair
+  requestBody:
+    required: true
+    content:
+      application/json:
+        schema:
+          oneOf:
+            - $ref: "#/components/schemas/ClassifyAction"
+            - $ref: "#/components/schemas/RepairAttemptAction"
+          discriminator:
+            propertyName: action
+            mapping:
+              classify: "#/components/schemas/ClassifyAction"
+              repairAttempt: "#/components/schemas/RepairAttemptAction"
+  responses:
+    "200":
+      description: Classification verdict, or repair attempt outcome.
+      content:
+        application/json:
+          schema:
+            $ref: ../../components/schemas/tool-repair.yaml#/$defs/FailureClassification
+          example:
+            class: syntax-repairable
+            matchedPattern: syntax:missing-required
+            evidence: "must have required property 'command'"
+    "202":
+      description: Repair attempt finished; carries the attempt outcome.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [status]
+            properties:
+              status:
+                type: string
+                enum: [repaired, exhausted, rejected-non-syntax]
+                description: >-
+                  repaired = repairedArgs validated against the contract and
+                  ready for re-execution. exhausted = attempts or the per-turn
+                  cap ran out; error carries the original error plus the last
+                  repair error. rejected-non-syntax = the classification was
+                  semantic or transient; no model call was made.
+              repairedArgs:
+                type: object
+                description: Contract-valid repaired arguments; present only when status is repaired.
+              error:
+                type: string
+              classification:
+                $ref: ../../components/schemas/tool-repair.yaml#/$defs/FailureClassification
+          example:
+            status: repaired
+            repairedArgs:
+              path: src/index.ts
+              oldText: const x = 1
+              newText: const x = 2
+            classification:
+              class: syntax-repairable
+              matchedPattern: args:unbalanced-json
+              evidence: '{"path": "src/index.ts", "oldText": "const x'
+    "422":
+      description: Unknown action, or repairAttempt on a classification that is not syntax-repairable.
+
+x-actionVariants:
+  classifyFailure:
+    operationId: classifyFailure
+    method: post
+    discriminatorAction: classify
+    summary: >-
+      Classify a failed tool call (syntax-repairable | semantic | transient)
+      from (toolName, rawArgs, errorText) with zero model involvement.
+
+get:
+  operationId: listToolRepairs
+  summary: Read the append-only tool-repair evidence log
+  description: >-
+    Reads .pi/mini/tool-repairs.jsonl (one RepairLogRecord per line, newest
+    last) and returns it, optionally filtered. The log is append-only evidence
+    under the existing .pi conventions: every repair attempt on every failed
+    call is recorded with its classification, per-attempt detail, and final
+    status, so audits can prove the guardrails held and no failure was
+    silently dropped.
+  tags:
+    - tool-call-repair
+  parameters:
+    - name: turn
+      in: query
+      required: false
+      description: Filter to records from this user-turn number (1-based).
+      schema:
+        type: integer
+        minimum: 1
+    - name: tool
+      in: query
+      required: false
+      description: Filter to records for this tool name (e.g. "edit", "bash").
+      schema:
+        type: string
+    - name: status
+      in: query
+      required: false
+      description: Filter to records with this final status.
+      schema:
+        type: string
+        enum: [repaired, exhausted, rejected-non-syntax]
+  responses:
+    "200":
+      description: Matching log records in append order.
+      content:
+        application/json:
+          schema:
+            type: array
+            items:
+              $ref: ../../components/schemas/tool-repair.yaml#/$defs/RepairLogRecord
+    "404":
+      description: The log file does not exist yet (no repair has ever been attempted).
+
+components:
+  schemas:
+    ClassifyAction:
+      description: POST body variant action=classify — pure regex/structural failure classification, zero model involvement.
+      type: object
+      required: [action, toolName, rawArgs, errorText]
+      properties:
+        action:
+          type: string
+          enum: [classify]
+        toolName:
+          type: string
+          description: Name of the tool whose call failed (e.g. "edit", "bash").
+        rawArgs:
+          type: string
+          description: The failed call's raw arguments EXACTLY as emitted (may be truncated/unbalanced JSON text).
+        errorText:
+          type: string
+          description: The execution error message verbatim.
+    RepairAttemptAction:
+      description: >-
+        POST body variant action=repairAttempt — run one bounded, isolated
+        repair call against the tiny model and return the validated outcome
+        (operationId runRepairAttempt).
+      type: object
+      required: [action, toolName, contract, rawArgs, errorText, attempt]
+      properties:
+        action:
+          type: string
+          enum: [repairAttempt]
+        toolName:
+          type: string
+        contract:
+          $ref: ../../components/schemas/tool-repair.yaml#/$defs/ToolContract
+        rawArgs:
+          type: string
+          description: The failed call's raw arguments verbatim; the ONLY input the fixer sees.
+        errorText:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+          maximum: 2
+          description: 1-based attempt number; must not exceed RetryPolicy.maxRepairAttemptsPerCall.

@@ -24,3 +24,5 @@ channels:
     $ref: channels/ollama-ndjson.yaml
   goalLedger:
     $ref: channels/goal-ledger.yaml
+  toolRepair:
+    $ref: channels/tool-repair.yaml

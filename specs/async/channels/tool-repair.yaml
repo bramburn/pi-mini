@@ -1,0 +1,233 @@
+# Tool-call syntax-failure repair event stream. One JSON object per line,
+# appended to .pi/mini/tool-repairs.jsonl alongside the log record; the
+# events below are the pi-mini-recognized vocabulary of the repair loop, in
+# lifecycle order: a failed call is classified, then zero or more isolated
+# repair attempts run, then the loop closes as accepted, exhausted, or
+# rejected. Semantic failures emit only repairRejected (non-syntax) and never
+# touch the model; transient failures retry with bounded backoff and emit no
+# repair events except a terminal repairExhausted when the backoff schedule
+# runs out.
+#
+# BOUNDARY: these events are POST-execution. The PRE-execution stream-level
+# wrap-fix (wrapfix.ts) emits wrapfixCall on the ollama-ndjson channel and is
+# capped at 2 conversions per turn; repair events here are capped at 2 repair
+# calls per turn on an INDEPENDENT counter (see RetryPolicy).
+address: tool-repair
+description: >-
+  Tool-call repair event vocabulary at .pi/mini/tool-repairs.jsonl. Every
+  event carries `type` (the name below), `ts` (ISO-8601), `turn` (1-based
+  user-turn number), `toolName`, and the FailureClassification; attempt
+  events additionally carry the RepairAttempt detail. The events mirror the
+  state machine advance() in tests/unit/lib/tool-call-repair.mjs
+  (requested -> attempting -> accepted | attempting -> exhausted | rejected).
+x-feature: tool-call-repair
+messages:
+  repairRequested:
+    description: >-
+      repair_requested — a tool call ran and failed; the classifier returned
+      syntax-repairable, so the call enters the repair loop (state
+      "attempting", attempt 1). Emitted only after the transient and semantic
+      checks cleared; semantic failures emit repair_rejected instead and
+      transient failures go straight to bounded backoff without any event
+      until they either recover or exhaust.
+    payload:
+      allOf:
+        - $ref: ../../api/components/schemas/tool-repair.yaml#/$defs/FailureClassification
+        - type: object
+          required: [type, ts, turn, toolName]
+          properties:
+            type:
+              type: string
+              enum: [repair_requested]
+            ts:
+              type: string
+              format: date-time
+            turn:
+              type: integer
+              minimum: 1
+            toolName:
+              type: string
+    examples:
+      - payload:
+          type: repair_requested
+          ts: "2026-10-07T11:12:00.000Z"
+          turn: 3
+          toolName: edit
+          class: syntax-repairable
+          matchedPattern: args:unbalanced-json
+          evidence: '{"path": "src/index.ts", "oldText": "const x'
+  repairAttempted:
+    description: >-
+      repair_attempted — one isolated repair /api/chat call finished (attempt
+      N of at most 2). Carries the full RepairAttempt: the exact bounded
+      request (fixer system prompt + ToolContract + verbatim rawArgs +
+      classification), the raw reply, the strict-JSON-only extraction verdict,
+      the contract validation verdict, and the duration. Emitted for BOTH
+      accepted and failed attempts; a failed attempt that still has budget is
+      followed by another repair_attempted for attempt N+1.
+    payload:
+      allOf:
+        - $ref: ../../api/components/schemas/tool-repair.yaml#/$defs/RepairAttempt
+        - type: object
+          required: [type, ts, turn, toolName]
+          properties:
+            type:
+              type: string
+              enum: [repair_attempted]
+            ts:
+              type: string
+              format: date-time
+            turn:
+              type: integer
+              minimum: 1
+            toolName:
+              type: string
+    examples:
+      - payload:
+          type: repair_attempted
+          ts: "2026-10-07T11:12:05.000Z"
+          turn: 3
+          toolName: edit
+          attempt: 1
+          maxAttempts: 2
+          request:
+            system: "You repair tool-call syntax ONLY. Preserve the call's intent verbatim. Output STRICT JSON only."
+            user: "TOOL CONTRACT..."
+          response:
+            replyText: '{"path":"src/index.ts","oldText":"const x","newText":"const y"}'
+            extraction:
+              ok: true
+              args:
+                path: src/index.ts
+            validation:
+              ok: true
+              errors: []
+          durationMs: 812
+  repairAccepted:
+    description: >-
+      repair_accepted — a repair attempt produced contract-valid repairedArgs
+      (strict-JSON-only extraction + validateAgainstContract both passed) and
+      the call was re-executed. Terminal for this call; the loop closes with
+      finalStatus "repaired" and the log record is appended.
+    payload:
+      allOf:
+        - type: object
+          required: [type, ts, turn, toolName, classification, repairedArgs]
+          properties:
+            type:
+              type: string
+              enum: [repair_accepted]
+            ts:
+              type: string
+              format: date-time
+            turn:
+              type: integer
+              minimum: 1
+            toolName:
+              type: string
+            classification:
+              $ref: ../../api/components/schemas/tool-repair.yaml#/$defs/FailureClassification
+            repairedArgs:
+              type: object
+              description: The contract-valid repaired arguments that were re-executed.
+        - type: object
+    examples:
+      - payload:
+          type: repair_accepted
+          ts: "2026-10-07T11:12:05.500Z"
+          turn: 3
+          toolName: edit
+          classification:
+            class: syntax-repairable
+            matchedPattern: args:unbalanced-json
+          repairedArgs:
+            path: src/index.ts
+            oldText: const x = 1
+            newText: const x = 2
+  repairExhausted:
+    description: >-
+      repair_exhausted — the repair loop closed WITHOUT a valid repair: either
+      both attempts failed (each re-classified before the next), or the
+      per-turn repair-call cap (2, independent of wrapfix 2/turn and delegate
+      8/turn) was already spent. Terminal; the ORIGINAL error plus the last
+      repair error are surfaced to the main loop as the tool_result — never
+      silently dropped — and the log record carries finalStatus "exhausted"
+      with originalError AND finalError.
+    payload:
+      allOf:
+        - type: object
+          required: [type, ts, turn, toolName, classification, originalError, finalError]
+          properties:
+            type:
+              type: string
+              enum: [repair_exhausted]
+            ts:
+              type: string
+              format: date-time
+            turn:
+              type: integer
+              minimum: 1
+            toolName:
+              type: string
+            classification:
+              $ref: ../../api/components/schemas/tool-repair.yaml#/$defs/FailureClassification
+            originalError:
+              type: string
+            finalError:
+              type: string
+        - type: object
+    examples:
+      - payload:
+          type: repair_exhausted
+          ts: "2026-10-07T11:13:10.000Z"
+          turn: 3
+          toolName: bash
+          classification:
+            class: syntax-repairable
+            matchedPattern: syntax:missing-required
+          originalError: "must have required property 'command'"
+          finalError: "repair attempt 2: strict-JSON-only extraction failed — reply contained prose around the JSON object"
+  repairRejected:
+    description: >-
+      repair_rejected — non-syntax: the classifier returned semantic (valid
+      syntax, wrong meaning — file not found, command not found, non-zero exit
+      with well-formed args) or the failure originated inside a repair call
+      itself (repair calls never recurse). Zero model involvement; the
+      original error is returned to the main loop as-is and the log record
+      carries finalStatus "rejected-non-syntax".
+    payload:
+      allOf:
+        - type: object
+          required: [type, ts, turn, toolName, classification, originalError]
+          properties:
+            type:
+              type: string
+              enum: [repair_rejected]
+            ts:
+              type: string
+              format: date-time
+            turn:
+              type: integer
+              minimum: 1
+            toolName:
+              type: string
+            classification:
+              $ref: ../../api/components/schemas/tool-repair.yaml#/$defs/FailureClassification
+            originalError:
+              type: string
+            reason:
+              type: string
+              enum: [non-syntax, no-recursion]
+        - type: object
+    examples:
+      - payload:
+          type: repair_rejected
+          ts: "2026-10-07T11:14:00.000Z"
+          turn: 3
+          toolName: bash
+          classification:
+            class: semantic
+            matchedPattern: semantic:file-not-found
+            evidence: "ENOENT: no such file or directory, open 'src/missing.ts'"
+          originalError: "ENOENT: no such file or directory, open 'src/missing.ts'"
+          reason: non-syntax

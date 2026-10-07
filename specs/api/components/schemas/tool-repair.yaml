@@ -1,0 +1,330 @@
+description: >-
+  Tool-call syntax-failure repair schemas: the regex-based failure
+  classification, the isolated repair-attempt record, the append-only
+  .pi/mini/tool-repairs.jsonl log record, the retry policy constants, and the
+  ToolContract summary the fixer prompt is built from. This is the
+  POST-execution complement to the stream-level wrap-fix: wrapfix.ts repairs
+  degraded tool-call TEXT before the done event; this feature repairs tool
+  calls that RAN and FAILED on syntax, in an isolated /api/chat context.
+type: object
+x-feature: tool-call-repair
+$defs:
+  FailureClassification:
+    description: >-
+      Regex-based classification of a failed tool call. Given
+      (toolName, rawArgs, errorText) the classifier returns exactly one class:
+      "syntax-repairable" (JSON unparseable or contract-shape violation — the
+      args mean something but are malformed; eligible for the isolated repair
+      call), "semantic" (valid syntax, wrong meaning — NEVER sent to repair,
+      returned to the main loop as-is), or "transient" (timeout / connection /
+      rate-limit signal — retried with bounded backoff, no LLM repair).
+      Precedence is fixed and documented: (1) transient transport signals win
+      over everything (a cheap retry outranks an LLM call); (2) structural
+      checks over rawArgs (unbalanced braces/quotes, contract shape) next;
+      (3) syntax error-text patterns; (4) semantic error-text patterns; (5)
+      default "semantic". Every matched pattern id below is implemented
+      verbatim in tests/unit/lib/tool-call-repair.mjs (classifyFailure) and
+      asserted row-by-row in tests/unit/tool-call-repair.test.mjs.
+    type: object
+    required: [class]
+    properties:
+      class:
+        type: string
+        enum: [syntax-repairable, semantic, transient]
+      matchedPattern:
+        type: string
+        description: >-
+          Identifier of the regex (or structural check) that decided the class.
+          Structural checks over rawArgs use the ids "args:unbalanced-json",
+          "contract:missing-required", "contract:unknown-field", and
+          "contract:type-mismatch". Error-text patterns use the ids below.
+        enum:
+          - args:unbalanced-json
+          - contract:missing-required
+          - contract:unknown-field
+          - contract:type-mismatch
+          - transient:errno
+          - transient:timeout
+          - transient:connection
+          - transient:rate-limit
+          - syntax:unexpected-token
+          - syntax:unterminated-string
+          - syntax:invalid-json
+          - syntax:missing-required
+          - syntax:additional-prop
+          - syntax:type-mismatch
+          - semantic:file-not-found
+          - semantic:command-not-found
+          - semantic:exit-code
+          - semantic:default
+      evidence:
+        type: string
+        description: >-
+          Verbatim substring of errorText (or the rawArgs fragment) that the
+          matched pattern hit, so the classification is auditable without
+          re-running the regex.
+    examples:
+      - class: syntax-repairable
+        matchedPattern: syntax:missing-required
+        evidence: "must have required property 'command'"
+      - class: semantic
+        matchedPattern: semantic:file-not-found
+        evidence: "ENOENT: no such file or directory, open 'src/missing.ts'"
+      - class: transient
+        matchedPattern: transient:errno
+        evidence: "connect ETIMEDOUT 127.0.0.1:11434"
+
+  RegexPattern:
+    description: >-
+      One documented classifier pattern. The full table lives in
+      classification.feature and is reference-implemented in
+      tests/unit/lib/tool-call-repair.mjs; this schema exists so the API can
+      report which rows of the table are in force.
+    type: object
+    required: [id, source, class]
+    properties:
+      id:
+        type: string
+        description: Stable pattern identifier (same vocabulary as FailureClassification.matchedPattern).
+      source:
+        type: string
+        description: "What the regex runs against: \"errorText\" or \"rawArgs\"."
+        enum: [errorText, rawArgs]
+      pattern:
+        type: string
+        description: The regex source, in ECMA-Script syntax (case-insensitive flags in the implementation).
+      class:
+        type: string
+        enum: [syntax-repairable, semantic, transient]
+
+  ToolContract:
+    description: >-
+      Minimal argument-contract summary of one pi-mini tool, distilled from
+      its JSON-schema parameters. This — and ONLY this — is what the isolated
+      repair call is told about the tool: name, the required fields, and each
+      field's primitive type. No descriptions, no enums, no session content;
+      the fixer must not be able to "improve" the call's intent, only its
+      syntax/structure.
+    type: object
+    required: [name, required, fields]
+    properties:
+      name:
+        type: string
+        description: Canonical tool name (e.g. "edit", "bash").
+        examples: [edit, bash]
+      required:
+        type: array
+        items:
+          type: string
+        description: Field names that must be present and non-undefined in the args object.
+        examples:
+          - [path, oldText, newText]
+      fields:
+        type: object
+        description: >-
+          Map of field name -> primitive JSON type
+          ("string" | "number" | "integer" | "boolean" | "array" | "object").
+          Any field not listed here is unknown and rejected by validation.
+        additionalProperties:
+          type: string
+          enum: [string, number, integer, boolean, array, object]
+        examples:
+          - path: string
+            oldText: string
+            newText: string
+
+  RepairAttempt:
+    description: >-
+      One isolated repair attempt: a single small /api/chat call that asks the
+      model to fix ONLY the syntax/structure of a failed call's rawArgs. The
+      context contains the fixer system prompt, the ToolContract summary, the
+      failed rawArgs verbatim, and the FailureClassification — nothing else.
+      num_ctx is pinned small (4096) and num_predict is capped (<=300) so a
+      repair call can never crowd out the main loop; the 90s stall watchdog
+      applies to repair calls exactly as to stream calls. The response is
+      extracted with strict-JSON-only parsing (extractRepairedArgs) and MUST
+      validate against the ToolContract (validateAgainstContract) before the
+      repaired args are accepted for re-execution.
+    type: object
+    required: [attempt, maxAttempts, request, response, durationMs]
+    properties:
+      attempt:
+        type: integer
+        minimum: 1
+        maximum: 2
+        description: 1-based attempt number for this failed call; never exceeds maxAttempts.
+      maxAttempts:
+        type: integer
+        const: 2
+        default: 2
+        description: Hard cap on repair attempts per failed call (RetryPolicy.maxRepairAttemptsPerCall).
+      request:
+        type: object
+        description: >-
+          The isolated repair context: fixer system prompt
+          ("repair ONLY the syntax/structure; preserve the call's intent
+          verbatim; output STRICT JSON only"), the ToolContract summary, the
+          failed rawArgs verbatim, and the failure classification. Byte-budgeted
+          (see REPAIR_CONTEXT_BYTE_BUDGET) and contains no session history.
+        required: [system, user]
+        properties:
+          system:
+            type: string
+          user:
+            type: string
+      response:
+        type: object
+        description: >-
+          Raw outcome of the repair /api/chat call: the reply text verbatim,
+          the extracted args (when strict-JSON-only extraction succeeded), and
+          the contract validation verdict.
+        required: [replyText, extraction, validation]
+        properties:
+          replyText:
+            type: string
+          extraction:
+            type: object
+            required: [ok]
+            properties:
+              ok:
+                type: boolean
+              args:
+                type: object
+              error:
+                type: string
+          validation:
+            type: object
+            required: [ok]
+            properties:
+              ok:
+                type: boolean
+              errors:
+                type: array
+                items:
+                  type: string
+      durationMs:
+        type: integer
+        minimum: 0
+        description: Wall time of the repair /api/chat call, including the stall watchdog.
+
+  RepairLogRecord:
+    description: >-
+      One append-only JSONL line of .pi/mini/tool-repairs.jsonl. Every repair
+      attempt — accepted or not — appends exactly one record per failed call
+      when the loop closes (attempts[] carries the per-attempt detail), per
+      the existing .pi conventions (.pi/mini/agents.md, .pi/goals/*). The log
+      is evidence for audits: it proves guardrails held (attempt counts, caps)
+      and never silently drops a failure (originalError always present;
+      finalError present on exhaustion).
+    type: object
+    required: [ts, turn, toolName, classification, attempts, finalStatus, originalError]
+    properties:
+      ts:
+        type: string
+        format: date-time
+        description: When the repair loop for this call closed.
+      turn:
+        type: integer
+        minimum: 1
+        description: 1-based user-turn number the failure occurred in.
+      toolName:
+        type: string
+      classification:
+        $ref: "#/$defs/FailureClassification"
+      attempts:
+        type: array
+        items:
+          $ref: "#/$defs/RepairAttempt"
+      finalStatus:
+        type: string
+        enum: [repaired, exhausted, rejected-non-syntax]
+        description: >-
+          repaired = a repair attempt produced contract-valid args that were
+          re-executed. exhausted = attempts or the per-turn cap ran out; the
+          ORIGINAL error plus the last repair error are surfaced to the main
+          loop as the tool_result (no silent drop). rejected-non-syntax = the
+          classifier said semantic/transient and no LLM repair was ever
+          attempted.
+      originalError:
+        type: string
+        description: Verbatim error text of the original failed execution; always present.
+      finalError:
+        type: string
+        description: >-
+          Last repair attempt's error (extraction or validation failure, or
+          the re-execution error of the last repaired attempt). Present only
+          when finalStatus is "exhausted".
+    examples:
+      - ts: "2026-10-07T11:15:00.000Z"
+        turn: 3
+        toolName: edit
+        classification:
+          class: syntax-repairable
+          matchedPattern: args:unbalanced-json
+          evidence: '{"path": "src/index.ts", "oldText": "const x'
+        attempts:
+          - attempt: 1
+            maxAttempts: 2
+            request:
+              system: "You repair tool-call syntax ONLY..."
+              user: "TOOL CONTRACT..."
+            response:
+              replyText: '{"path":"src/index.ts","oldText":"const x","newText":"const y"}'
+              extraction:
+                ok: true
+                args:
+                  path: src/index.ts
+              validation:
+                ok: true
+                errors: []
+            durationMs: 812
+        finalStatus: repaired
+        originalError: "Unexpected end of JSON input"
+
+  RetryPolicy:
+    description: >-
+      Guardrail constants for the tool-call repair loop. These compose with —
+      and never conflate with — the pre-existing per-turn budgets: wrapfix
+      conversions are capped at 2/turn (index.ts MAX_WRAPFIX_CONVERSIONS_PER_TURN)
+      and delegate_to_worker at 8/turn (config delegateBudget, default 8). Each
+      counter is independent: spending the wrapfix budget does not shrink the
+      repair budget and vice versa. Semantic failures NEVER enter repair;
+      transient failures retry with bounded backoff and NEVER invoke the LLM.
+    type: object
+    required:
+      - maxRepairAttemptsPerCall
+      - maxRepairCallsPerTurn
+      - backoffMsForTransient
+    properties:
+      maxRepairAttemptsPerCall:
+        type: integer
+        const: 2
+        default: 2
+        description: >-
+          Hard cap on repair attempts for a single failed call. Each failed
+          attempt is re-classified before the next; after exhaustion the
+          original error plus the last repair error are surfaced to the main
+          loop as the tool_result — never silently dropped.
+      maxRepairCallsPerTurn:
+        type: integer
+        const: 2
+        default: 2
+        description: >-
+          Hard cap on repair /api/chat calls per user turn, counted separately
+          from wrapfix conversions (2/turn) and delegate_to_worker calls
+          (8/turn). When the cap is hit, the pending repair is not started and
+          the failure surfaces to the main loop as-is.
+      backoffMsForTransient:
+        type: array
+        items:
+          type: integer
+          minimum: 0
+        minItems: 2
+        maxItems: 2
+        default: [500, 2000]
+        description: >-
+          Bounded backoff schedule for transient (timeout / connection /
+          rate-limit) retries, in milliseconds, indexed by 0-based retry
+          number. The list length IS the retry cap: after the last backoff the
+          next transient failure exhausts the call and its original error
+          surfaces. No LLM repair is involved at any point.

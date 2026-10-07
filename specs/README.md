@@ -96,6 +96,29 @@ implementation.
   32768 with projected-usage compaction (80% incl. the 8192 output reserve);
   stale summaries re-prompt, never silently reused.
 
+### tool-call-repair — syntax-failure repair loop (guardrails, retries, regex classification)
+- Spec: `api/paths/tool-repair/repair.yaml`, `api/components/schemas/tool-repair.yaml`
+  (FailureClassification + regex taxonomy, ToolContract, RepairAttempt,
+  RepairLogRecord, RetryPolicy), `async/channels/tool-repair.yaml`
+  (repairRequested / Attempted / Accepted / Exhausted / Rejected),
+  `features/tool-call-repair/*.feature` (5 files: classification,
+  isolated-repair, guardrails-retries, boundaries, logging)
+- Reference logic: `tests/unit/lib/tool-call-repair.mjs` (regex classifier,
+  repair-context builder with 2048-byte budget, strict-JSON extractor,
+  contract validator, guardrail state machine); 22 unit tests in
+  `tests/unit/tool-call-repair.test.mjs`
+- Silo: `scripts/silo/tool-call-repair.mjs` → `evidence/silo/tool-call-repair.log`
+  (truncated-JSON repair PASS, type-violation repair PASS, prose-strictness
+  rejection PASS, semantic negative with zero LLM calls — 4/4 probes, 3 chat calls)
+- Key decisions: fixed precedence transient → rawArgs structure → syntax
+  error-text → semantic; semantic failures (ENOENT, exit codes) NEVER enter
+  repair; per-call max 2 attempts, per-turn cap 2 on a counter independent of
+  wrapfix (2/turn) and delegate (8/turn); exhaustion surfaces original + last
+  repair error to the main loop; no recursion; transient = bounded backoff
+  [500, 2000] with zero LLM involvement; every attempt logged to
+  `.pi/mini/tool-repairs.jsonl`. Boundary: wrapfix is pre-execution stream
+  repair, this is the post-execution fallback.
+
 ## Naming rules
 
 - OpenAPI paths/specs: kebab-case YAML, one path per file, grouped under

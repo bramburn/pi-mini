@@ -23,6 +23,8 @@ tags:
     description: /mini settings submenu including the local-model picker
   - name: mini-context
     description: Mini AGENTS.md context budgeting
+  - name: tool-call-repair
+    description: Post-execution syntax repair of failed tool calls (isolated fixer context, bounded retries)
 paths:
   /api/chat:
     $ref: paths/ollama/chat.yaml
@@ -36,6 +38,8 @@ paths:
     $ref: paths/settings-page/model-picker.yaml
   /mini/mini-context/context-budget:
     $ref: paths/mini-context/context-budget.yaml
+  /mini/tool-repair:
+    $ref: paths/tool-repair/repair.yaml
 components:
   schemas:
     ChatRequest:
@@ -52,3 +56,5 @@ components:
       $ref: components/schemas/audit-result.yaml
     ContextBudget:
       $ref: components/schemas/context-budget.yaml
+    ToolRepair:
+      $ref: components/schemas/tool-repair.yaml
